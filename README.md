@@ -41,7 +41,7 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 - Vite + React (쉼표 스택 재활용)
 - 다크 터미널 미학 (JetBrains Mono, 고밀도 데이터 뷰)
-- GitHub Pages 서빙
+- GitHub Pages 서빙 (MVP 릴리즈 시 배포 예정)
 
 ## 게이트 확정 (이 레포가 증명하는 것)
 
