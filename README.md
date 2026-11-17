@@ -96,6 +96,26 @@ npm run dev                                # 데스크 실행
 
 수동 배포는 `npm run build` 후 `dist/`를 Pages에 올리면 된다.
 
+## 검증 도구
+
+실제 데몬/백엔드 없이 전송 계층을 확인할 수 있는 목 서버 두 개를 넣어 두었다(Python + aiohttp).
+
+```bash
+python3 tools/mock-daemon.py     # :9470 — /health, /v1/ws_ticket, /v1/pair, /ws(JSON-RPC v2)
+python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SSE, CORS 허용)
+```
+
+`mock-daemon.py`는 실제 프로토콜 프레임을 그대로 흉내낸다: `hello`, `session.list`,
+`session.create`, `session.messages`, `catalog.models`, `memory.list`/`memory.usage`,
+그리고 `turn.start` 이후의 `session.event` 델타·`turn_completed`(usage). 데스크를 `/dm`으로
+연결하면 세션 목록·메모리·스트리밍·usage까지 실제 경로로 확인된다.
+
+## 메모리 주입에 대해
+
+이 클라이언트의 `memory` 토글은 **클라이언트 쪽 주입**이다: 켜면 `memory.list`의 active 항목을
+`<memory>` 블록으로 만들어 프롬프트 앞에 붙이고, 붙는 그대로를 사이드바 `injected context`에서 보여준다.
+데몬 설정의 `[memory]`가 켜져 있으면 데몬도 자기 원장을 주입하므로, 중복을 피하려면 한쪽만 켜면 된다.
+
 ## 데몬 표면과의 정렬
 
 이 클라이언트는 `damon-agent-core`의 실제 구현을 기준으로 맞췄다(`src/api.rs`, `docs/protocol-v2.md`).
