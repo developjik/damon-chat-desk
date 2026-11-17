@@ -86,9 +86,15 @@ npm run dev                                # 데스크 실행
 
 ## 배포
 
-`main`에 푸시하면 `.github/workflows/deploy.yml`이 `dist/`를 GitHub Pages로 올린다.
-저장소 Settings → Pages → Source를 **GitHub Actions**로 한 번 지정하면 된다.
-(최초 1회는 Pages 활성화가 필요하다.)
+빌드 산출물은 `dist/`이고 `base`가 `/damon-chat-desk/`라 프로젝트 페이지에 그대로 맞는다.
+자동 배포 워크플로는 [`docs/deploy.workflow.yml`](docs/deploy.workflow.yml)에 있다 —
+`.github/workflows/deploy.yml`로 복사하고 Settings → Pages → Source를 **GitHub Actions**로
+한 번 지정하면 `main` 푸시마다 테스트·빌드·배포가 돈다.
+
+지금 이 PR에는 워크플로 파일을 넣지 않았다: 푸시 주체(GitHub App)에 `workflows` 스코프가 없어
+`.github/workflows/` 경로의 푸시가 거부되기 때문이다. 파일을 옮기는 것만으로 동작한다.
+
+수동 배포는 `npm run build` 후 `dist/`를 Pages에 올리면 된다.
 
 ## 데몬 표면과의 정렬
 

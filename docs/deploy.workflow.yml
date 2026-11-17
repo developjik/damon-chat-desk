@@ -1,3 +1,11 @@
+# GitHub Pages 자동 배포 워크플로.
+#
+# 이 파일은 `.github/workflows/deploy.yml`로 옮겨야 동작한다.
+# (지금은 커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로
+#  푸시할 수 없다 — 웹 에디터에서 복사해 넣으면 그대로 동작한다.)
+#
+# Settings → Pages → Source: GitHub Actions 로 한 번 지정한 뒤,
+# main에 푸시할 때마다 테스트·빌드·배포가 돈다.
 name: Deploy to GitHub Pages
 
 on:
