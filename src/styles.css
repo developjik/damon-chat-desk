@@ -636,6 +636,40 @@ a {
   gap: 8px;
 }
 
+/* command palette trigger — reads as a keyboard hint, not a button */
+.palette-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-faint);
+  background: var(--surface);
+}
+
+.palette-trigger:hover {
+  color: var(--text-dim);
+  border-color: #34343a;
+}
+
+.palette-trigger-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.palette-trigger-key {
+  font-size: 10px;
+}
+
+.stop-turn {
+  height: 24px;
+  padding: 0 8px;
+  color: var(--err);
+  border-color: rgba(239, 107, 107, 0.35);
+}
+
 .badge {
   font-size: 9.5px;
   letter-spacing: 0.08em;
@@ -958,6 +992,12 @@ a {
 .slot-error {
   color: var(--err);
   font-size: 12.5px;
+  margin: 0;
+}
+
+.slot-canceled {
+  color: var(--text-faint);
+  font-size: 12px;
   margin: 0;
 }
 
@@ -2096,6 +2136,22 @@ a {
   line-height: 1.65;
 }
 
+.empty-kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: -8px 0 20px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.empty-kbd span {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
 .suggestions {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2356,6 +2412,147 @@ a {
   letter-spacing: 0.03em;
 }
 
+/* ---------------------------------------------------------------- command palette */
+
+.overlay.palette-overlay {
+  align-items: flex-start;
+  padding-top: min(14vh, 124px);
+}
+
+.palette {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 560px;
+  max-height: min(64dvh, 540px);
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.62);
+}
+
+.palette-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.palette-key {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+
+.palette-input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.palette-input::placeholder {
+  color: var(--text-faint);
+}
+
+.palette-count {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+
+.palette-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: 4px 0 6px;
+  list-style: none;
+}
+
+.palette-row {
+  margin: 0;
+}
+
+.palette-group {
+  padding: 8px 12px 3px;
+  color: var(--text-faint);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 12px;
+  text-align: left;
+  border-left: 2px solid transparent;
+}
+
+.palette-item:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.palette-item[aria-selected="true"] {
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+}
+
+.palette-item-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.palette-item:disabled .palette-item-label {
+  color: var(--text-faint);
+}
+
+.palette-item-detail {
+  flex-shrink: 1;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.palette-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.palette-foot {
+  display: flex;
+  gap: 12px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
 /* ---------------------------------------------------------------- toast */
 
 .toast {
@@ -2521,6 +2718,38 @@ a {
 
   .plan-hint {
     display: none;
+  }
+
+  /* Command palette: 16px keeps iOS from zooming the sheet on focus;
+     the keyboard hint chips are desktop-only. */
+  .palette-overlay {
+    padding: 12px;
+    padding-top: 10vh;
+  }
+
+  .palette {
+    max-height: 72dvh;
+  }
+
+  .palette-search {
+    padding: 8px 10px;
+  }
+
+  .palette-input {
+    font-size: 16px;
+  }
+
+  .palette-key,
+  .palette-foot {
+    display: none;
+  }
+
+  .palette-item {
+    padding: 8px 10px;
+  }
+
+  .palette-item-detail {
+    max-width: 38%;
   }
 
   /* Touch has no hover: the per-card actions stay visible. */

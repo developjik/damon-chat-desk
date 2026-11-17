@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { DeskState } from '../lib/desk';
+import { isLoopbackHost, pageOrigin } from '../lib/hosting';
 import type { TransportKind } from '../lib/types';
 
 interface ConnectPanelProps {
@@ -16,6 +17,9 @@ type Tab = 'demo' | 'daemon' | 'openai';
 
 export function ConnectPanel({ open, state, onClose, onConnect, onDemo, onPair, onCheckPairing }: ConnectPanelProps) {
   const current: Tab = state.connection.transport === 'openai' ? 'openai' : state.connection.transport === 'daemon' ? 'daemon' : 'demo';
+  // A public https page cannot open this machine's loopback daemon.
+  const origin = pageOrigin();
+  const staticHttps = !!origin && origin.protocol === 'https:' && !isLoopbackHost(origin.hostname);
   const [tab, setTab] = useState<Tab>(current);
   const [baseUrl, setBaseUrl] = useState(
     state.connection.transport === 'demo' ? 'http://127.0.0.1:9470' : state.connection.baseUrl,
@@ -107,6 +111,12 @@ export function ConnectPanel({ open, state, onClose, onConnect, onDemo, onPair, 
                 로컬 프록시 /dm
               </button>
             </div>
+            {staticHttps ? (
+              <p className="panel-note">
+                이 페이지는 https 정적 호스팅입니다. 브라우저가 <code className="md-code mono">http://127.0.0.1</code> 데몬에 직접 붙지 못하므로(혼합 콘텐츠·사설망 차단),
+                여기서는 <strong>Demo</strong> 탭으로 체험하고, 데몬을 쓰려면 같은 오리진 프록시(<code className="md-code mono">/dm</code>) 뒤에 두세요.
+              </p>
+            ) : null}
             <p className="panel-note">
               데몬은 CORS 헤더를 보내지 않습니다. 다른 오리진(GitHub Pages 등)의 페이지는 브라우저가 fetch를 막으므로, 이 저장소의{' '}
               <code className="md-code mono">npm run dev</code>가 여는 <code className="md-code mono">/dm</code> 프록시로 붙이세요.

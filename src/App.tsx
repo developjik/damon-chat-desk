@@ -1,8 +1,10 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import type { DeskController, DeskState } from './lib/desk';
+import type { PaletteHandlers } from './lib/commands';
 import { copyText, downloadPayload } from './lib/download';
 import type { ExportFormat } from './lib/export';
 import type { PlanDecision, ReplySlot, TransportKind } from './lib/types';
+import { CommandPalette } from './components/CommandPalette';
 import { Composer } from './components/Composer';
 import { ConnectPanel } from './components/ConnectPanel';
 import { ExportMenu } from './components/ExportMenu';
@@ -30,6 +32,9 @@ function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state
       <p className="empty-copy">
         메시지마다 프로바이더를 고르고, 같은 프롬프트를 두 곳에 동시에 보내 비교합니다. 대화와 메모리는 브라우저가 아니라 데몬에 남습니다.
         {state.connection.transport === 'demo' ? ' 지금은 시뮬레이션된 데모 데몬으로 동작합니다.' : ''}
+      </p>
+      <p className="empty-kbd mono">
+        <span>⌘K</span> / <span>Ctrl+K</span> — 커맨드 팔레트
       </p>
       <div className="suggestions">
         {SUGGESTIONS.map((suggestion) => (
@@ -64,6 +69,8 @@ function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state
 export function App({ desk }: AppProps) {
   const state = useSyncExternalStore(desk.subscribe, desk.getSnapshot);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const closePalette = useCallback(() => setPaletteOpen(false), []);
   const [toast, setToast] = useState<string | null>(null);
   const conversation = state.conversations.find((entry) => entry.id === state.activeId) ?? null;
 
@@ -73,6 +80,24 @@ export function App({ desk }: AppProps) {
     const timer = setTimeout(() => setToast(null), 3200);
     return () => clearTimeout(timer);
   }, [state.notice]);
+
+  // Cmd/Ctrl+K opens the palette; Esc stops the live turn when no overlay
+  // owns the key. The palette and the connect panel handle their own Esc.
+  const overlayOpen = paletteOpen || connectOpen;
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && (event.key === 'k' || event.key === 'K')) {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+        return;
+      }
+      if (event.key === 'Escape' && !overlayOpen) {
+        desk.stop();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [desk, overlayOpen]);
 
   const connect = (transport: TransportKind, baseUrl: string, opts: { masterToken?: string; deviceToken?: string }) => {
     void desk.connect(transport, baseUrl, opts).then(() => setConnectOpen(false));
@@ -119,6 +144,24 @@ export function App({ desk }: AppProps) {
     const copied = await copyText(payload.content);
     desk.notify(copied ? 'Markdown을 클립보드에 복사했습니다' : '클립보드 복사가 차단되었습니다 — 다운로드를 쓰세요');
   };
+
+  const paletteHandlers: PaletteHandlers = useMemo(
+    () => ({
+      newConversation: () => desk.newConversation(),
+      selectConversation: (id) => desk.selectConversation(id),
+      setCompare: (compare) => desk.setCompare(compare),
+      setMemoryEnabled: (enabled) => desk.setMemoryEnabled(enabled),
+      openMemoryPanel: () => desk.openSidebar(true),
+      enterDemo: () => void desk.enterDemo(),
+      openConnect: () => setConnectOpen(true),
+      exportConversation: (format) => exportConversation(format),
+      copyMarkdown: () => void copyConversation(),
+      setPrimary: (key) => desk.setPrimary(key),
+      setSecondary: (key) => desk.setSecondary(key),
+      stop: () => desk.stop(),
+    }),
+    [desk, conversation?.id],
+  );
 
   return (
     <div className="app">
@@ -174,6 +217,23 @@ export function App({ desk }: AppProps) {
           <div className="topbar-right">
             {conversation?.forkedFrom ? <span className="badge mono">branch</span> : null}
             {state.compare ? <span className="badge mono">split</span> : null}
+            {state.busy ? (
+              <button type="button" className="ghost-btn tiny stop-turn" onClick={() => desk.stop()} title="진행 중인 턴 중단 (Esc)">
+                ■ stop
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="palette-trigger"
+              onClick={() => setPaletteOpen(true)}
+              aria-label="커맨드 팔레트 열기"
+              title="커맨드 팔레트 (⌘K / Ctrl+K)"
+            >
+              <span className="palette-trigger-icon" aria-hidden>
+                ⌘
+              </span>
+              <span className="palette-trigger-key mono">K</span>
+            </button>
             <ExportMenu
               disabled={!conversation || conversation.messages.length === 0}
               onExport={exportConversation}
@@ -190,7 +250,7 @@ export function App({ desk }: AppProps) {
           onRetry={(message, slot) => {
             if (conversation) void desk.retrySlot(conversation.id, message.id, slot.id);
           }}
-          onCancel={(slot) => desk.cancel(slot.id)}
+          onCancel={(slot) => desk.stop(slot.id)}
           onRespond={(slot, actionId) => respond(slot, actionId)}
           onFork={(message) => fork(message.id)}
           onPlan={(message, slot, decision, feedback) => plan(message.id, slot, decision, feedback)}
@@ -223,6 +283,8 @@ export function App({ desk }: AppProps) {
         onPair={(key, name) => void desk.pairDevice(key, name)}
         onCheckPairing={() => void desk.checkPairing()}
       />
+
+      <CommandPalette open={paletteOpen} state={state} handlers={paletteHandlers} onClose={closePalette} />
 
       {toast ? <div className="toast mono">{toast}</div> : null}
     </div>

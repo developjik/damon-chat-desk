@@ -10,6 +10,7 @@ import { DaemonTransport, normalizeBaseUrl, type DaemonSessionRow } from './daem
 import { DEMO_ROUTES, DemoTransport, composeReply } from './demo';
 import { probe } from './detect';
 import { buildExport, type ExportFormat, type ExportPayload } from './export';
+import { needsDemoFallback, pageOrigin } from './hosting';
 import { memoryErrorInfo } from './memory';
 import { listModels, streamChat } from './openai';
 import { loadState, saveState, safeStorage, type SavedState } from './persistence';
@@ -119,6 +120,10 @@ export class DeskController {
   private storage: Storage | undefined;
   private deps: DeskDeps;
   private aborters = new Map<string, AbortController>();
+  /** slotId → where it lives, so a stop can mark it without a scan. */
+  private slotIndex = new Map<string, { convId: string; messageId: string }>();
+  /** Slots stopped by hand — late tokens from the wire are dropped. */
+  private stoppedSlots = new Set<string>();
   private emitTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: DeskDeps = {}) {
@@ -256,6 +261,12 @@ export class DeskController {
     if (this.state.conversations.length === 0) this.seedDemoConversations();
     if (this.savedTransport === 'demo') {
       await this.enterDemo(this.state.conversations.length === 0 ? undefined : 'saved demo session');
+      return;
+    }
+    // A static https page (GitHub Pages) cannot open this machine's
+    // loopback daemon — land in the demo instead of an offline screen.
+    if (needsDemoFallback(this.savedTransport, this.savedBaseUrl, pageOrigin())) {
+      await this.enterDemo('정적 호스팅에서는 로컬 데몬에 붙을 수 없습니다 — 데모로 체험하세요');
       return;
     }
     const baseUrl = this.savedBaseUrl;
@@ -1154,6 +1165,9 @@ export class DeskController {
   private async runSlot(convId: string, messageId: string, slotId: string, target: RouteTarget, prompt: string): Promise<void> {
     const aborter = new AbortController();
     this.aborters.set(slotId, aborter);
+    this.slotIndex.set(slotId, { convId, messageId });
+    // A retry reuses the slot id; it must not inherit the last stop.
+    this.stoppedSlots.delete(slotId);
     this.patchSlot(convId, messageId, slotId, { status: 'streaming', startedAt: Date.now() });
 
     const injection = this.state.memory.enabled ? memoryBlock(this.state.memory.entries) : '';
@@ -1168,17 +1182,21 @@ export class DeskController {
         this.applyEvent(convId, messageId, slotId, event);
       }
       this.patchSlot(convId, messageId, slotId, (slot) => ({
-        status: slot.status === 'error' ? 'error' : 'done',
+        // A stop wins over the stream's own ending: the partial text stays.
+        status: slot.status === 'error' ? 'error' : slot.status === 'canceled' ? 'canceled' : 'done',
         endedAt: Date.now(),
       }));
     } catch (error) {
-      this.patchSlot(convId, messageId, slotId, {
-        status: 'error',
-        error: (error as Error).message,
+      const canceled = aborter.signal.aborted;
+      this.patchSlot(convId, messageId, slotId, () => ({
+        status: canceled ? 'canceled' : 'error',
+        error: canceled ? undefined : (error as Error).message,
         endedAt: Date.now(),
-      });
+      }));
     } finally {
       this.aborters.delete(slotId);
+      this.slotIndex.delete(slotId);
+      this.stoppedSlots.delete(slotId);
     }
   }
 
@@ -1227,6 +1245,9 @@ export class DeskController {
   }
 
   private applyEvent(convId: string, messageId: string, slotId: string, event: StreamEvent): void {
+    // A stopped slot is terminal: a daemon that keeps streaming (or a
+    // slow frame already on the wire) must not grow the partial answer.
+    if (this.stoppedSlots.has(slotId)) return;
     switch (event.type) {
       case 'start':
         // Time to first token is a reply metric, not a connection one —
@@ -1310,7 +1331,12 @@ export class DeskController {
         break;
       case 'done':
         this.patchSlot(convId, messageId, slotId, (slot) => ({
-          status: slot.status === 'error' ? 'error' : 'done',
+          status:
+            slot.status === 'error'
+              ? 'error'
+              : slot.status === 'canceled' || event.stopReason === 'canceled'
+                ? 'canceled'
+                : 'done',
           endedAt: Date.now(),
           usage: { ...slot.usage, ...(event.usage ?? {}) },
         }));
@@ -1349,11 +1375,37 @@ export class DeskController {
     this.persist();
   }
 
-  cancel(slotId?: string): void {
+  /**
+   * Stop the live turn (`turn.cancel` / `stop` button / Esc). The slot is
+   * marked `canceled` the moment it is stopped — before the transport
+   * unwinds — so the partial answer is kept and never flashes `error`.
+   * Returns how many slots were stopped.
+   */
+  stop(slotId?: string): number {
     const ids = slotId ? [slotId] : [...this.aborters.keys()];
+    let stopped = 0;
     for (const id of ids) {
-      this.aborters.get(id)?.abort();
+      const aborter = this.aborters.get(id);
+      if (!aborter) continue;
+      const where = this.slotIndex.get(id);
+      if (where) {
+        this.patchSlot(where.convId, where.messageId, id, (slot) =>
+          slot.status === 'streaming' || slot.status === 'queued'
+            ? { status: 'canceled', endedAt: Date.now() }
+            : {},
+        );
+      }
+      aborter.abort();
+      this.stoppedSlots.add(id);
+      stopped += 1;
     }
+    if (stopped > 0) this.set({ notice: '턴 중단 — 부분 응답은 그대로 남습니다' });
+    return stopped;
+  }
+
+  /** Kept for callers that predate `stop`; same behaviour. */
+  cancel(slotId?: string): void {
+    this.stop(slotId);
   }
 
   async respond(ask: PermissionAsk, action: PermissionAction, sessionId?: string): Promise<void> {

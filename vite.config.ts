@@ -1,12 +1,21 @@
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
+import { resolveBasePath } from './src/lib/hosting';
+
+/**
+ * The config runs in Node before Vite loads. This project has no
+ * @types/node on purpose, so declare the one slice read here.
+ */
+declare const process: { env: Record<string, string | undefined> };
 
 /** `/dm/health` → `/health` on the daemon. */
 const stripDm = (path: string): string => path.replace(/^\/dm/, '');
 
 export default defineConfig({
-  // GitHub Pages project page — the SPA lives under /damon-chat-desk/.
-  base: '/damon-chat-desk/',
+  // Static hosting path. GitHub Pages project page:
+  //   VITE_BASE_PATH=/damon-chat-desk/ npm run build
+  // Local dev/preview default to `/`.
+  base: resolveBasePath(process.env.VITE_BASE_PATH),
   // This sandbox has no /etc/hosts entry for `localhost`; bind by IP so
   // the dev server and vitest never try to resolve the name.
   //

@@ -6,6 +6,9 @@
 #
 # Settings → Pages → Source: GitHub Actions 로 한 번 지정한 뒤,
 # main에 푸시할 때마다 테스트·빌드·배포가 돈다.
+#
+# 빌드 단계의 VITE_BASE_PATH가 이 리포의 Pages 경로(/damon-chat-desk/)를
+# vite base로 넘긴다 — 없으면 asset이 /assets/로 나가 404가 된다.
 name: Deploy to GitHub Pages
 
 on:
@@ -40,6 +43,8 @@ jobs:
         run: npm test
 
       - name: Build
+        env:
+          VITE_BASE_PATH: /damon-chat-desk/
         run: npm run build
 
       - uses: actions/configure-pages@v5
