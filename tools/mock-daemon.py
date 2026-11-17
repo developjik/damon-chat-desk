@@ -8,8 +8,12 @@ docs/protocol-v2.md):
   POST /v1/pair         -> {deviceId, token, status}
   POST /v1/pair/status  -> {status}
   GET  /ws?ticket=...   -> JSON-RPC v2: hello, session.list, session.create,
-                           session.messages, session.fork, catalog.models,
-                           memory.list, memory.usage,
+                           session.messages, session.fork, session.rename,
+                           session.set_archived, session.delete,
+                           session.export, catalog.models,
+                           memory.list, memory.usage, memory.write,
+                           memory.remove, memory.approve, memory.reject,
+                           memory.pending,
                            turn.start (streams session.event), turn.steer,
                            turn.cancel,
                            plan.list, plan.respond, permission.respond
@@ -22,24 +26,78 @@ design ask — parks a `kind: plan` review that stays blocked until
 """
 import asyncio
 import json
+import time
 
 from aiohttp import web
 
 TICKETS = set()
+NOW = int(time.time() * 1000)
 SESSIONS = [
-    {"sessionId": "sess-a1b2c3", "createdAt": 1763000000000, "backend": "claude",
+    {"sessionId": "sess-a1b2c3", "createdAt": NOW - 90 * 60 * 1000, "backend": "claude",
      "title": "damon-agent-core API 리뷰", "cwd": "/home/dev/damon", "tags": [], "pinned": True, "archived": False},
-    {"sessionId": "sess-d4e5f6", "createdAt": 1762900000000, "backend": "codex",
+    {"sessionId": "sess-d4e5f6", "createdAt": NOW - 220 * 60 * 1000, "backend": "codex",
      "title": "assignment-map 수집기 복구", "cwd": "/home/dev/assignment-map", "tags": [], "pinned": False, "archived": False},
+    {"sessionId": "sess-g7h8i9", "createdAt": NOW - 26 * 60 * 60 * 1000, "backend": "qwen",
+     "title": "qwen CLI 설치 메모", "cwd": "/home/dev/qwen", "tags": [], "pinned": False, "archived": True},
 ]
 MESSAGES = {
     "sess-a1b2c3": [
-        {"id": 1, "role": "user", "ts": 1763000000000, "data": {"content": "세션 목록 API에서 archived 처리는 어떻게 하지?"}},
-        {"id": 2, "role": "assistant", "ts": 1763000001000,
+        {"id": 1, "role": "user", "ts": NOW - 100 * 60 * 1000, "data": {"content": "세션 목록 API에서 archived 처리는 어떻게 하지?"}},
+        {"id": 2, "role": "assistant", "ts": NOW - 99 * 60 * 1000,
          "data": {"content": "`session.list`는 `includeArchived`가 없으면 archived를 숨깁니다. 보관은 삭제가 아니므로 행은 남고, retention sweep에서도 살아남습니다."}},
     ],
     "sess-d4e5f6": [],
 }
+
+# The memory ledgers: one per (scope, owner). Chars counts ACTIVE only.
+MEMORY_LIMIT = 8000
+MEMORY = [
+    {"id": "m1", "scope": "user", "owner": None, "status": "active", "source": "daemon",
+     "content": "WS 티켓은 1회용, 60초 만료. 재사용하면 401.",
+     "createdAt": NOW - 40 * 60 * 1000, "updatedAt": NOW - 40 * 60 * 1000},
+    {"id": "m2", "scope": "user", "owner": None, "status": "active", "source": "daemon",
+     "content": "선호 스택: Vite + React, 1px 보더 다크 UI.",
+     "createdAt": NOW - 30 * 60 * 1000, "updatedAt": NOW - 30 * 60 * 1000},
+    {"id": "m3", "scope": "user", "owner": None, "status": "pending", "source": "agent",
+     "content": "릴리스마다 CHANGELOG.md 갱신",
+     "createdAt": NOW - 12 * 60 * 1000, "updatedAt": NOW - 12 * 60 * 1000},
+    {"id": "m5", "scope": "user", "owner": None, "status": "pending", "source": "agent",
+     "content": "리뷰 코멘트 순서: 재현 → 기대 → 실제",
+     "createdAt": NOW - 4 * 60 * 1000, "updatedAt": NOW - 4 * 60 * 1000},
+    {"id": "m4", "scope": "bot", "owner": "scribe", "status": "active", "source": "daemon",
+     "content": "릴리스 노트는 날짜 → 변경 → 근거 순서로 적는다.",
+     "createdAt": NOW - 6 * 60 * 60 * 1000, "updatedAt": NOW - 6 * 60 * 60 * 1000},
+]
+
+INVISIBLE = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
+
+
+def ledger(scope, owner):
+    if scope == "bot":
+        return [row for row in MEMORY if row["scope"] == "bot" and (row.get("owner") or "") == (owner or "")]
+    return [row for row in MEMORY if row["scope"] == "user"]
+
+
+def ledger_chars(scope, owner):
+    return sum(len(row["content"]) for row in ledger(scope, owner) if row["status"] == "active")
+
+
+def memory_gate(content, scope, owner):
+    """One gate chain: empty/scoping → invisible → secret → injection → cap."""
+    if not content or scope not in ("user", "bot") or (scope == "bot" and not owner):
+        return {"code": -32602, "message": "memory.write needs content and a valid scope/owner"}
+    if any(char in content for char in INVISIBLE):
+        return {"code": -32011, "message": "memory rejected: invisible characters", "data": {"kind": "invisible"}}
+    if any(marker in content for marker in ("sk-", "AKIA", "ghp_", "PRIVATE KEY")):
+        return {"code": -32011, "message": "memory rejected: secret", "data": {"kind": "secret"}}
+    lowered = content.lower()
+    if any(marker in lowered for marker in ("ignore previous", "ignore all previous", "system prompt", "이전 지시")):
+        return {"code": -32011, "message": "memory rejected: prompt injection", "data": {"kind": "prompt_injection"}}
+    current = ledger_chars(scope, owner)
+    if current + len(content) > MEMORY_LIMIT:
+        return {"code": -32011, "message": "memory rejected: capacity",
+                "data": {"kind": "capacity", "limit": MEMORY_LIMIT, "current": current, "attempted": len(content)}}
+    return None
 
 DELTAS = [
     "데몬 쪽 이벤트를 그대로 렌더하는 게 핵심입니다. ",
@@ -70,7 +128,10 @@ STEERS = []
 
 
 def plan_intent(prompt):
-    return any(word in prompt for word in ("계획", "순서", "설계", "plan", "roadmap"))
+    # The `<memory>` block is data, not instructions — the daemon's real
+    # gate looks at the user's words, so strip it before matching.
+    body = prompt.split("</memory>", 1)[-1] if "<memory>" in prompt else prompt
+    return any(word in body for word in ("계획", "순서", "설계", "plan", "roadmap"))
 
 
 async def health(request):
@@ -137,7 +198,7 @@ async def ws_handler(request):
         await ws.send_str(json.dumps({"id": rid, "result": {"turnId": "t1", "stopReason": "completed",
                                                              "usage": {"input_tokens": 128, "output_tokens": 96,
                                                                        "cost_usd": 0.0021}}}))
-        MESSAGES.setdefault(session_id, []).append({"id": 90, "role": "assistant", "ts": 1763000009000,
+        MESSAGES.setdefault(session_id, []).append({"id": 90, "role": "assistant", "ts": NOW,
                                                     "data": {"content": "".join(DELTAS)}})
 
     async def run_shell_tool(session_id):
@@ -207,11 +268,49 @@ async def ws_handler(request):
             await ws.send_str(json.dumps({"id": rid, "result": {"protocol": 2, "daemon": "damond", "version": "0.7.2",
                                                                 "backends": ["claude", "codex"]}}))
         elif method == "session.list":
-            await ws.send_str(json.dumps({"id": rid, "result": {"sessions": SESSIONS}}))
+            rows = [row for row in SESSIONS
+                    if params.get("includeArchived") or not row.get("archived")]
+            if params.get("backend"):
+                rows = [row for row in rows if row["backend"] == params["backend"]]
+            limit = params.get("limit")
+            if isinstance(limit, int):
+                rows = rows[:limit]
+            await ws.send_str(json.dumps({"id": rid, "result": {"sessions": rows}}))
+        elif method == "session.rename":
+            row = next((row for row in SESSIONS if row["sessionId"] == params.get("sessionId")), None)
+            title = (params.get("title") or "").strip()
+            if row is None or not title:
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32602, "message": "session.rename needs sessionId and title"}}))
+            else:
+                row["title"] = title
+                await ws.send_str(json.dumps({"id": rid, "result": {"renamed": True}}))
+        elif method == "session.set_archived":
+            row = next((row for row in SESSIONS if row["sessionId"] == params.get("sessionId")), None)
+            if row is None:
+                await ws.send_str(json.dumps({"id": rid, "result": {"updated": False}}))
+            else:
+                row["archived"] = bool(params.get("archived"))
+                await ws.send_str(json.dumps({"id": rid, "result": {"updated": True}}))
+        elif method == "session.delete":
+            session_id = params.get("sessionId")
+            before = len(SESSIONS)
+            SESSIONS[:] = [row for row in SESSIONS if row["sessionId"] != session_id]
+            MESSAGES.pop(session_id, None)
+            await ws.send_str(json.dumps({"id": rid, "result": {"deleted": len(SESSIONS) != before}}))
+        elif method == "session.export":
+            session_id = params.get("sessionId")
+            row = next((row for row in SESSIONS if row["sessionId"] == session_id), None)
+            if row is None:
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32602, "message": "unknown session"}}))
+            else:
+                await ws.send_str(json.dumps({"id": rid, "result": {
+                    "session": row,
+                    "messages": MESSAGES.get(session_id, []),
+                    "usage": {"contextUsed": 3120, "contextSize": 200000, "costUsd": 0.0021, "turns": 1}}}))
         elif method == "session.create":
             sid = "sess-new-" + str(COUNTER["n"])
             COUNTER["n"] += 1
-            SESSIONS.insert(0, {"sessionId": sid, "createdAt": 1763000500000, "backend": params.get("backend", "claude"),
+            SESSIONS.insert(0, {"sessionId": sid, "createdAt": NOW, "backend": params.get("backend", "claude"),
                                 "title": None, "cwd": None, "tags": [], "pinned": False, "archived": False})
             await ws.send_str(json.dumps({"id": rid, "result": {"sessionId": sid, "backend": params.get("backend", "claude"), "replayed": 0}}))
         elif method == "session.messages":
@@ -221,7 +320,7 @@ async def ws_handler(request):
             sid = "sess-fork-" + str(COUNTER["n"])
             COUNTER["n"] += 1
             existing = next((row for row in SESSIONS if row["sessionId"] == source), None)
-            SESSIONS.insert(0, {"sessionId": sid, "createdAt": 1763000600000,
+            SESSIONS.insert(0, {"sessionId": sid, "createdAt": NOW,
                                 "backend": (existing or {}).get("backend", "claude"),
                                 "title": ((existing or {}).get("title") or "세션") + " (fork)",
                                 "cwd": (existing or {}).get("cwd"), "tags": [], "pinned": False, "archived": False})
@@ -235,12 +334,50 @@ async def ws_handler(request):
             }.get(backend, [])
             await ws.send_str(json.dumps({"id": rid, "result": {"models": models, "modes": []}}))
         elif method == "memory.list":
-            await ws.send_str(json.dumps({"id": rid, "result": {"entries": [
-                {"id": "m1", "scope": "user", "content": "WS 티켓은 1회용, 60초 만료. 재사용하면 401.", "status": "active", "source": "daemon"},
-                {"id": "m2", "scope": "user", "content": "선호 스택: Vite + React, 1px 보더 다크 UI.", "status": "active", "source": "daemon"},
-            ]}}))
+            scope = params.get("scope", "user")
+            owner = params.get("owner")
+            entries = [dict(row) for row in ledger(scope, owner)
+                       if params.get("includePending") or row["status"] == "active"]
+            await ws.send_str(json.dumps({"id": rid, "result": {"entries": entries}}))
+        elif method == "memory.pending":
+            await ws.send_str(json.dumps({"id": rid, "result": {"entries": [dict(row) for row in MEMORY if row["status"] == "pending"]}}))
         elif method == "memory.usage":
-            await ws.send_str(json.dumps({"id": rid, "result": {"scope": "user", "chars": 96, "limit": 8000}}))
+            scope = params.get("scope", "user")
+            owner = params.get("owner")
+            await ws.send_str(json.dumps({"id": rid, "result": {"scope": scope, "owner": owner,
+                                                               "chars": ledger_chars(scope, owner), "limit": MEMORY_LIMIT}}))
+        elif method == "memory.write":
+            scope = params.get("scope", "user")
+            owner = params.get("owner")
+            content = (params.get("content") or "").strip()
+            refusal = memory_gate(content, scope, owner)
+            if refusal is not None:
+                await ws.send_str(json.dumps({"id": rid, "error": refusal}))
+            else:
+                COUNTER["n"] += 1
+                entry = {"id": f"m{COUNTER['n']}", "scope": scope,
+                         "owner": owner if scope == "bot" else None,
+                         "content": content, "source": params.get("source") or "desk",
+                         "status": "pending" if scope == "bot" else "active",
+                         "createdAt": NOW, "updatedAt": NOW}
+                MEMORY.insert(0, entry)
+                await ws.send_str(json.dumps({"id": rid, "result": {"id": entry["id"], "status": entry["status"]}}))
+        elif method == "memory.remove":
+            before = len(MEMORY)
+            MEMORY[:] = [row for row in MEMORY if row["id"] != params.get("id")]
+            await ws.send_str(json.dumps({"id": rid, "result": {"removed": len(MEMORY) != before}}))
+        elif method == "memory.approve":
+            row = next((row for row in MEMORY if row["id"] == params.get("id")), None)
+            approved = row is not None and row["status"] == "pending"
+            if approved:
+                row["status"] = "active"
+            await ws.send_str(json.dumps({"id": rid, "result": {"approved": approved}}))
+        elif method == "memory.reject":
+            row = next((row for row in MEMORY if row["id"] == params.get("id")), None)
+            rejected = row is not None and row["status"] == "pending"
+            if rejected:
+                MEMORY.remove(row)
+            await ws.send_str(json.dumps({"id": rid, "result": {"rejected": rejected}}))
         elif method == "turn.start":
             asyncio.create_task(run_turn(params.get("sessionId"), params.get("prompt", ""), rid))
         elif method == "turn.steer":

@@ -8,9 +8,10 @@
  * demo branch: the badge says "simulated" and nothing else changes.
  */
 
-import type { MemoryEntry, PlanDecision, PlanRequest, ReplySlot, RouteTarget, StreamEvent, ToolCall, ToolResult } from './types';
+import type { MemoryEntry, MemoryScope, PlanDecision, PlanRequest, ReplySlot, RouteTarget, StreamEvent, ToolCall, ToolResult } from './types';
 import { makeTarget } from './targets';
 import { buildPlan } from './plan';
+import { MemoryRejection, memoryStats } from './memory';
 
 interface DemoProfile {
   provider: string;
@@ -522,6 +523,8 @@ export interface DemoSession {
   backend: string;
   title: string;
   createdAt: number;
+  pinned?: boolean;
+  archived?: boolean;
 }
 
 const DEFAULT_SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -562,31 +565,154 @@ export class DemoTransport {
         status: 'pending',
         updatedAt: this.deps.now(),
       },
+      {
+        id: 'mem-b1',
+        scope: 'bot',
+        owner: 'scribe',
+        content: '릴리스 노트는 CHANGELOG.md에 날짜 → 변경 → 근거 순서로 적는다.',
+        source: 'demo',
+        status: 'active',
+        updatedAt: this.deps.now(),
+      },
     ];
   }
 
-  /* seed a conversation list so a first visit is not an empty shell */
+  /** Restore a ledger the desk kept in local storage (demo writes persist). */
+  hydrateMemory(entries: MemoryEntry[]): void {
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    this.memoryEntries = entries.map((entry) => ({ ...entry }));
+  }
+
+  /** seed a conversation list so a first visit is not an empty shell */
   seedSessions(rows: DemoSession[]): void {
     this.sessions = [...rows];
   }
 
-  sessionsList(): DemoSession[] {
-    return [...this.sessions];
+  sessionsList(includeArchived = false): DemoSession[] {
+    return this.sessions.filter((row) => includeArchived || !row.archived);
   }
 
   addSession(session: DemoSession): void {
     this.sessions = [session, ...this.sessions.filter((row) => row.sessionId !== session.sessionId)];
   }
 
-  memory(includePending = false): MemoryEntry[] {
-    return this.memoryEntries.filter((entry) => includePending || entry.status === 'active');
+  /** `session.rename` — the demo's row title is the whole record. */
+  renameSession(sessionId: string, title: string): boolean {
+    const row = this.sessions.find((entry) => entry.sessionId === sessionId);
+    if (!row) return false;
+    row.title = title;
+    return true;
   }
 
-  memoryUsage(): { chars: number; limit: number } {
-    const chars = this.memoryEntries
-      .filter((entry) => entry.status === 'active')
-      .reduce((total, entry) => total + entry.content.length, 0);
-    return { chars, limit: 8000 };
+  /** `session.set_archived` — hidden from the list, history kept. */
+  setArchived(sessionId: string, archived: boolean): boolean {
+    const row = this.sessions.find((entry) => entry.sessionId === sessionId);
+    if (!row) return false;
+    row.archived = archived;
+    return true;
+  }
+
+  deleteSession(sessionId: string): boolean {
+    const before = this.sessions.length;
+    this.sessions = this.sessions.filter((row) => row.sessionId !== sessionId);
+    return this.sessions.length !== before;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* memory ledger                                                      */
+  /* ---------------------------------------------------------------- */
+
+  private readonly memoryLimit = 8000;
+
+  private inLedger(entry: MemoryEntry, scope: MemoryScope, owner?: string | null): boolean {
+    if ((entry.scope === 'bot' ? 'bot' : 'user') !== scope) return false;
+    if (scope !== 'bot') return true;
+    return (entry.owner ?? '') === (owner ?? '');
+  }
+
+  /** `memory.list {scope, owner?, includePending?}` over the simulated ledgers. */
+  memoryList(input: { scope?: MemoryScope; owner?: string | null; includePending?: boolean } = {}): MemoryEntry[] {
+    const scope = input.scope ?? 'user';
+    return this.memoryEntries
+      .filter((entry) => this.inLedger(entry, scope, input.owner))
+      .filter((entry) => input.includePending === true || entry.status === 'active')
+      .map((entry) => ({ ...entry }));
+  }
+
+  memory(includePending = false): MemoryEntry[] {
+    return this.memoryList({ scope: 'user', includePending });
+  }
+
+  memoryUsage(scope: MemoryScope = 'user', owner?: string | null): { chars: number; limit: number } {
+    const ledger = this.memoryEntries.filter((entry) => this.inLedger(entry, scope, owner));
+    return { chars: memoryStats(ledger).chars, limit: this.memoryLimit };
+  }
+
+  /** Every ledger at once, for the desk's local-storage snapshot. */
+  snapshotMemory(): MemoryEntry[] {
+    return this.memoryEntries.map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * The demo's version of the gate chain: invisible chars, secrets, an
+   * instruction-shaped line, then the cap. Agent-shaped writes land
+   * `pending` exactly like a write that needs approval.
+   */
+  writeMemory(input: { scope: MemoryScope; owner?: string | null; content: string; source?: string }): {
+    id: string;
+    status: 'active' | 'pending';
+  } {
+    const content = input.content.trim();
+    if (!content) throw new MemoryRejection({ kind: 'invalid', message: 'empty content' });
+    if (input.scope === 'bot' && !input.owner) throw new MemoryRejection({ kind: 'invalid', message: 'owner required' });
+    if (/[\u200b-\u200f\u2060\ufeff]/.test(content)) throw new MemoryRejection({ kind: 'invisible' });
+    if (/sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(content)) {
+      throw new MemoryRejection({ kind: 'secret' });
+    }
+    if (/ignore (all )?(previous|above) instructions|system prompt|이전 지시.{0,8}무시|시스템 프롬프트/i.test(content)) {
+      throw new MemoryRejection({ kind: 'prompt_injection' });
+    }
+    const ledger = this.memoryEntries.filter((entry) => this.inLedger(entry, input.scope, input.owner));
+    const current = memoryStats(ledger).chars;
+    if (current + content.length > this.memoryLimit) {
+      throw new MemoryRejection({ kind: 'capacity', limit: this.memoryLimit, current, attempted: content.length });
+    }
+    const id = `mem-${this.memoryEntries.length + 1}-${this.deps.now().toString(36)}`;
+    const agentWrite = input.scope === 'bot' || (input.source ?? '').startsWith('agent');
+    const entry: MemoryEntry = {
+      id,
+      scope: input.scope,
+      owner: input.scope === 'bot' ? input.owner ?? null : null,
+      content,
+      source: input.source ?? 'demo',
+      status: agentWrite ? 'pending' : 'active',
+      createdAt: this.deps.now(),
+      updatedAt: this.deps.now(),
+    };
+    this.memoryEntries = [entry, ...this.memoryEntries];
+    return { id, status: entry.status };
+  }
+
+  removeMemory(id: string): boolean {
+    const before = this.memoryEntries.length;
+    this.memoryEntries = this.memoryEntries.filter((entry) => entry.id !== id);
+    return this.memoryEntries.length !== before;
+  }
+
+  /** One-shot CAS: a settled entry cannot be approved twice. */
+  approveMemory(id: string): boolean {
+    const entry = this.memoryEntries.find((row) => row.id === id);
+    if (!entry || entry.status !== 'pending') return false;
+    entry.status = 'active';
+    entry.updatedAt = this.deps.now();
+    return true;
+  }
+
+  rejectMemory(id: string): boolean {
+    const entry = this.memoryEntries.find((row) => row.id === id);
+    if (!entry || entry.status !== 'pending') return false;
+    this.memoryEntries = this.memoryEntries.filter((row) => row.id !== id);
+    return true;
   }
 
   /* ---------------------------------------------------------------- */

@@ -1,8 +1,11 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { DeskController, DeskState } from './lib/desk';
+import { copyText, downloadPayload } from './lib/download';
+import type { ExportFormat } from './lib/export';
 import type { PlanDecision, ReplySlot, TransportKind } from './lib/types';
 import { Composer } from './components/Composer';
 import { ConnectPanel } from './components/ConnectPanel';
+import { ExportMenu } from './components/ExportMenu';
 import { Sidebar } from './components/Sidebar';
 import { Transcript } from './components/Transcript';
 
@@ -92,16 +95,61 @@ export function App({ desk }: AppProps) {
     void desk.respondPlan({ convId: conversation.id, messageId, slotId: slot.id }, decision, feedback);
   };
 
+  const exportConversation = (format: ExportFormat) => {
+    if (!conversation) {
+      desk.notify('내보낼 대화가 없습니다');
+      return;
+    }
+    const payload = desk.exportConversation(conversation.id, format);
+    if (!payload) return;
+    if (!downloadPayload(payload)) {
+      desk.notify('이 브라우저에서는 파일을 저장할 수 없습니다 — 클립보드 복사를 쓰세요');
+      return;
+    }
+    desk.notify(`${payload.filename} 저장됨`);
+  };
+
+  const copyConversation = async () => {
+    if (!conversation) {
+      desk.notify('복사할 대화가 없습니다');
+      return;
+    }
+    const payload = desk.exportConversation(conversation.id, 'markdown');
+    if (!payload) return;
+    const copied = await copyText(payload.content);
+    desk.notify(copied ? 'Markdown을 클립보드에 복사했습니다' : '클립보드 복사가 차단되었습니다 — 다운로드를 쓰세요');
+  };
+
   return (
     <div className="app">
       <Sidebar
         state={state}
         onNew={() => desk.newConversation()}
         onSelect={(id) => desk.selectConversation(id)}
-        onDelete={(id) => desk.deleteConversation(id)}
+        onDelete={(id) => void desk.deleteConversation(id)}
+        onRename={(id, title) => void desk.renameConversation(id, title)}
+        onArchive={(id, archived) => void desk.archiveConversation(id, archived)}
+        onSessionQuery={(query) => desk.setSessionQuery(query)}
+        onShowArchived={(show) => desk.setShowArchived(show)}
         onOpenDaemon={(row) => void desk.openDaemonSession(row)}
         onRefreshDaemon={() => void desk.refreshDaemonSessions()}
-        onMemory={(enabled) => desk.setMemoryEnabled(enabled)}
+        onRenameDaemon={(row, title) => void desk.renameDaemonSession(row, title)}
+        onArchiveDaemon={(row, archived) => void desk.archiveDaemonSession(row, archived)}
+        onDeleteDaemon={(row) => void desk.deleteDaemonSession(row)}
+        onMemoryToggle={(enabled) => desk.setMemoryEnabled(enabled)}
+        memory={{
+          onQuery: (text) => desk.setMemoryQuery(text),
+          onFilter: (filter) => desk.setMemoryFilter(filter),
+          onScope: (scope, owner) => void desk.setMemoryScope(scope, owner),
+          onAdd: (content) => void desk.addMemory(content),
+          onUpdate: (entry, content) => void desk.updateMemory(entry, content),
+          onRemove: (entry) => void desk.removeMemory(entry),
+          onApprove: (entry) => void desk.approveMemory(entry),
+          onReject: (entry) => void desk.rejectMemory(entry),
+          onRefresh: () => void desk.refreshMemory(),
+        }}
+        onExport={exportConversation}
+        onCopy={() => void copyConversation()}
         onConnect={() => setConnectOpen(true)}
         onDemo={() => void desk.enterDemo()}
         onClose={() => desk.openSidebar(false)}
@@ -126,6 +174,11 @@ export function App({ desk }: AppProps) {
           <div className="topbar-right">
             {conversation?.forkedFrom ? <span className="badge mono">branch</span> : null}
             {state.compare ? <span className="badge mono">split</span> : null}
+            <ExportMenu
+              disabled={!conversation || conversation.messages.length === 0}
+              onExport={exportConversation}
+              onCopy={() => void copyConversation()}
+            />
             <button type="button" className="icon-btn" onClick={() => setConnectOpen(true)} aria-label="연결 설정" title="연결 설정">
               ⚙
             </button>

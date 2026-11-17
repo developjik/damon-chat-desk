@@ -1,30 +1,42 @@
-import { memoryBlock, type DeskState } from '../lib/desk';
-import type { Conversation } from '../lib/types';
-import { backendTitle, type DaemonSessionRow } from '../lib/daemon';
+import type { DeskState } from '../lib/desk';
+import type { ExportFormat } from '../lib/export';
+import { conversationMeta, filterConversations, filterDaemonRows, relativeTime } from '../lib/sessions';
+import type { DaemonSessionRow } from '../lib/daemon';
+import type { MemoryEntry, MemoryFilter, MemoryScope } from '../lib/types';
+import { MemoryPanel } from './MemoryPanel';
+import { SessionList, type SessionItem } from './SessionList';
 
 interface SidebarProps {
   state: DeskState;
   onNew: () => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onArchive: (id: string, archived: boolean) => void;
+  onSessionQuery: (query: string) => void;
+  onShowArchived: (show: boolean) => void;
   onOpenDaemon: (row: DaemonSessionRow) => void;
   onRefreshDaemon: () => void;
-  onMemory: (enabled: boolean) => void;
+  onRenameDaemon: (row: DaemonSessionRow, title: string) => void;
+  onArchiveDaemon: (row: DaemonSessionRow, archived: boolean) => void;
+  onDeleteDaemon: (row: DaemonSessionRow) => void;
+  onMemoryToggle: (enabled: boolean) => void;
+  memory: {
+    onQuery: (text: string) => void;
+    onFilter: (filter: MemoryFilter) => void;
+    onScope: (scope: MemoryScope, owner?: string) => void;
+    onAdd: (content: string) => void;
+    onUpdate: (entry: MemoryEntry, content: string) => void;
+    onRemove: (entry: MemoryEntry) => void;
+    onApprove: (entry: MemoryEntry) => void;
+    onReject: (entry: MemoryEntry) => void;
+    onRefresh: () => void;
+  };
+  onExport: (format: ExportFormat) => void;
+  onCopy: () => void;
   onConnect: () => void;
   onDemo: () => void;
   onClose: () => void;
-}
-
-function relativeTime(ts: number): string {
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return '방금';
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}분 전`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}시간 전`;
-  return `${Math.floor(diff / 86_400_000)}일 전`;
-}
-
-function sessionTitle(conversation: Conversation): string {
-  return conversation.title || '새 대화';
 }
 
 export function Sidebar({
@@ -32,18 +44,58 @@ export function Sidebar({
   onNew,
   onSelect,
   onDelete,
+  onRename,
+  onArchive,
+  onSessionQuery,
+  onShowArchived,
   onOpenDaemon,
   onRefreshDaemon,
-  onMemory,
+  onRenameDaemon,
+  onArchiveDaemon,
+  onDeleteDaemon,
+  onMemoryToggle,
+  memory,
+  onExport,
+  onCopy,
   onConnect,
   onDemo,
   onClose,
 }: SidebarProps) {
-  const { connection, memory } = state;
+  const { connection } = state;
   const live = connection.status === 'live';
-  const conversations = [...state.conversations].sort((a, b) => b.updatedAt - a.updatedAt);
-  const activeEntries = memory.entries.filter((entry) => entry.status === 'active');
-  const preview = memoryBlock(memory.entries);
+  const query = state.sessions.query;
+  const showArchived = state.sessions.showArchived;
+  const archivedCount = state.conversations.filter((conversation) => conversation.archived === true).length;
+  const active = state.conversations.find((conversation) => conversation.id === state.activeId) ?? null;
+
+  const conversationItems: SessionItem[] = filterConversations(state.conversations, {
+    text: query,
+    archived: showArchived,
+  })
+    .slice()
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((conversation) => ({
+      key: conversation.id,
+      kind: 'local',
+      title: conversation.title || '새 대화',
+      meta: conversationMeta(conversation),
+      active: conversation.id === state.activeId,
+      archived: conversation.archived === true,
+    }));
+
+  const daemonRows = filterDaemonRows(state.daemonSessions, { text: query, includeArchived: showArchived });
+  const daemonByKey = new Map(state.daemonSessions.map((row) => [row.sessionId, row]));
+  const daemonItems: SessionItem[] = daemonRows.map((row) => ({
+    key: row.sessionId,
+    kind: 'daemon',
+    title: row.title || row.sessionId.slice(0, 12),
+    meta: `${relativeTime(row.createdAt)}${row.pinned ? ' · pinned' : ''}${row.archived ? ' · 보관' : ''}`,
+    badge: row.backend,
+    active: false,
+    archived: row.archived === true,
+  }));
+
+  const rowOf = (item: SessionItem): DaemonSessionRow | undefined => daemonByKey.get(item.key);
 
   return (
     <aside className={`sidebar ${state.sidebarOpen ? 'open' : ''}`}>
@@ -67,6 +119,19 @@ export function Sidebar({
         </span>
         새 대화
       </button>
+
+      <div className="export-row" role="group" aria-label="대화 내보내기">
+        <span className="export-row-label mono">export</span>
+        <button type="button" className="ghost-btn tiny" onClick={() => onExport('markdown')} disabled={!active} title="현재 대화를 Markdown 파일로">
+          ⤓ md
+        </button>
+        <button type="button" className="ghost-btn tiny" onClick={() => onExport('json')} disabled={!active} title="현재 대화를 JSON 파일로">
+          ⤓ json
+        </button>
+        <button type="button" className="ghost-btn tiny" onClick={onCopy} disabled={!active} title="Markdown을 클립보드로">
+          copy
+        </button>
+      </div>
 
       <section className={`conn-card ${connection.status}`}>
         <div className="conn-row">
@@ -100,113 +165,63 @@ export function Sidebar({
         )}
       </section>
 
-      <nav className="sessions">
-        <div className="section-head">
-          <span>sessions</span>
-          <span className="count mono">{conversations.length}</span>
-        </div>
-        <ul>
-          {conversations.map((conversation) => (
-            <li key={conversation.id}>
-              <button
-                type="button"
-                className={`session ${conversation.id === state.activeId ? 'active' : ''}`}
-                onClick={() => onSelect(conversation.id)}
-              >
-                <span className="session-title">{sessionTitle(conversation)}</span>
-                <span className="session-meta mono">
-                  {conversation.messages.length} msg · {relativeTime(conversation.updatedAt)}
-                </span>
-              </button>
-              <button
-                type="button"
-                className="session-del"
-                onClick={() => onDelete(conversation.id)}
-                aria-label="대화 삭제"
-                title="삭제"
-              >
-                ×
-              </button>
-            </li>
-          ))}
-          {conversations.length === 0 ? <li className="empty-row">아직 대화가 없습니다</li> : null}
-        </ul>
-      </nav>
+      <SessionList
+        items={conversationItems}
+        query={query}
+        title="sessions"
+        empty="아직 대화가 없습니다"
+        onQuery={onSessionQuery}
+        onSelect={(item) => onSelect(item.key)}
+        onRename={(item, title) => onRename(item.key, title)}
+        onArchive={(item, archived) => onArchive(item.key, archived)}
+        onDelete={(item) => onDelete(item.key)}
+        archivedCount={archivedCount}
+        showArchived={showArchived}
+        onShowArchived={onShowArchived}
+      />
 
       {connection.transport === 'daemon' && live ? (
-        <nav className="sessions daemon">
-          <div className="section-head">
-            <span>on the daemon</span>
-            <button type="button" className="icon-btn" onClick={onRefreshDaemon} aria-label="데몬 세션 새로고침" title="새로고침">
-              ↻
-            </button>
-          </div>
-          <ul>
-            {state.daemonSessions.map((row) => (
-              <li key={row.sessionId}>
-                <button type="button" className="session daemon-row" onClick={() => onOpenDaemon(row)}>
-                  <span className="backend-chip mono">{backendTitle(row.backend)}</span>
-                  <span className="session-title">{row.title || row.sessionId.slice(0, 10)}</span>
-                </button>
-              </li>
-            ))}
-            {state.daemonSessions.length === 0 ? <li className="empty-row">데몬에 세션이 없습니다</li> : null}
-          </ul>
-        </nav>
+        <SessionList
+          items={daemonItems}
+          query={query}
+          title="on the daemon"
+          empty="데몬에 세션이 없습니다"
+          onQuery={onSessionQuery}
+          onSelect={(item) => {
+            const row = rowOf(item);
+            if (row) onOpenDaemon(row);
+          }}
+          onRename={(item, title) => {
+            const row = rowOf(item);
+            if (row) onRenameDaemon(row, title);
+          }}
+          onArchive={(item, archived) => {
+            const row = rowOf(item);
+            if (row) onArchiveDaemon(row, archived);
+          }}
+          onDelete={(item) => {
+            const row = rowOf(item);
+            if (row) onDeleteDaemon(row);
+          }}
+          onRefresh={onRefreshDaemon}
+          showSearch={false}
+        />
       ) : null}
 
-      <section className="memory">
-        <div className="section-head">
-          <span>memory</span>
-          <label className="switch">
-            <input type="checkbox" checked={memory.enabled} onChange={(event) => onMemory(event.target.checked)} />
-            <span className="slider" aria-hidden />
-          </label>
-        </div>
-        <div className="memory-meta mono">
-          <span>
-            {activeEntries.length} active
-            {memory.entries.length > activeEntries.length ? ` · ${memory.entries.length - activeEntries.length} pending` : ''}
-          </span>
-          {memory.limit ? (
-            <span className="faint">
-              {memory.chars}/{memory.limit}
-            </span>
-          ) : (
-            <span className="faint">local</span>
-          )}
-        </div>
-        <ul className="memory-list">
-          {memory.entries.slice(0, 6).map((entry) => (
-            <li key={entry.id} className={entry.status}>
-              <span className={`mem-dot ${entry.status}`} aria-hidden />
-              <span className="mem-text">{entry.content}</span>
-            </li>
-          ))}
-          {memory.entries.length === 0 ? (
-            <li className="empty-row">
-              {connection.transport === 'daemon'
-                ? '메모리 원장이 비어 있습니다'
-                : connection.transport === 'demo'
-                  ? '시뮬레이션 원장을 사용합니다'
-                  : '이 모드에는 메모리 원장이 없습니다'}
-            </li>
-          ) : null}
-        </ul>
-        {preview ? (
-          <details className="mem-preview">
-            <summary className="mono">injected context</summary>
-            <pre className="mono">{preview}</pre>
-          </details>
-        ) : null}
-        <div className="memory-note">
-          {connection.transport === 'daemon'
-            ? 'memory.* RPC로 동기화 · 주입은 이 클라이언트가 프롬프트 앞에 붙입니다'
-            : connection.transport === 'demo'
-              ? '시뮬레이션된 원장 (localStorage)'
-              : 'OpenAI 호환 모드에서는 메모리 원장이 없습니다'}
-        </div>
-      </section>
+      <MemoryPanel
+        memory={state.memory}
+        transport={connection.transport}
+        onToggle={onMemoryToggle}
+        onQuery={memory.onQuery}
+        onFilter={memory.onFilter}
+        onScope={memory.onScope}
+        onAdd={memory.onAdd}
+        onUpdate={memory.onUpdate}
+        onRemove={memory.onRemove}
+        onApprove={memory.onApprove}
+        onReject={memory.onReject}
+        onRefresh={memory.onRefresh}
+      />
 
       <footer className="sidebar-foot">
         <span className="mono">damon-agent-core</span>

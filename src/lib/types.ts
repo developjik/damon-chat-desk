@@ -188,6 +188,11 @@ export interface Conversation {
   remote?: boolean;
   /** The conversation this one was forked from (session.fork). */
   forkedFrom?: string;
+  /**
+   * Archived sessions stay in storage but out of the sidebar list
+   * (`session.set_archived` on the daemon, a local flag otherwise).
+   */
+  archived?: boolean;
 }
 
 export interface DaemonHealth {
@@ -195,6 +200,12 @@ export interface DaemonHealth {
   version?: string;
   backends?: string[];
 }
+
+/**
+ * The two ledgers the daemon keeps: the user's own memory and a bot's
+ * (named by `owner`). `memory.*` takes a scope on every call.
+ */
+export type MemoryScope = 'user' | 'bot';
 
 export interface MemoryEntry {
   id: string;
@@ -206,6 +217,9 @@ export interface MemoryEntry {
   createdAt?: number | null;
   updatedAt?: number | null;
 }
+
+/** Which entries the memory panel shows. */
+export type MemoryFilter = 'all' | 'active' | 'pending';
 
 export interface ConnectionState {
   transport: TransportKind;

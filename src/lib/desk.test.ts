@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { DeskController, memoryBlock, titleOf } from './desk';
 import { DEMO_ROUTES, DemoTransport } from './demo';
+import { filterMemory } from './memory';
+import { filterConversations } from './sessions';
 import type { RouteTarget, StreamEvent } from './types';
 
 class MemoryStorage implements Storage {
@@ -361,5 +363,199 @@ describe('DeskController — session.fork', () => {
     const original = desk.getSnapshot().conversations.find((entry) => entry.id === source.id);
     expect(original?.messages).toHaveLength(2);
     expect(desk.getSnapshot().notice).toContain('분기');
+  });
+});
+
+describe('DeskController — memory ledger', () => {
+  it('writes an entry into the user ledger and re-reads it', async () => {
+    const { desk } = await ready();
+    const before = desk.getSnapshot().memory.entries.length;
+    await expect(desk.addMemory('선호 에디터: Cursor')).resolves.toBe(true);
+    const entries = desk.getSnapshot().memory.entries;
+    expect(entries.length).toBe(before + 1);
+    expect(entries.some((entry) => entry.content === '선호 에디터: Cursor')).toBe(true);
+    expect(desk.getSnapshot().memory.chars).toBeGreaterThan(0);
+    expect(desk.getSnapshot().notice).toContain('memory.write');
+  });
+
+  it('keeps a refused write out of the ledger and says why', async () => {
+    const { desk } = await ready();
+    const before = desk.getSnapshot().memory.entries;
+    await expect(desk.addMemory('token: sk-abcdefghijklmnopqrstuvwxyz')).resolves.toBe(false);
+    expect(desk.getSnapshot().memory.entries).toHaveLength(before.length);
+    expect(desk.getSnapshot().memory.error).toContain('비밀키');
+  });
+
+  it('edits by writing the new text and removing the old id', async () => {
+    const { desk } = await ready();
+    const entry = desk.getSnapshot().memory.entries.find((row) => row.status === 'active');
+    expect(entry).toBeTruthy();
+    await expect(desk.updateMemory(entry!, '수정된 한 줄')).resolves.toBe(true);
+    const entries = desk.getSnapshot().memory.entries;
+    expect(entries.some((row) => row.id === entry!.id)).toBe(false);
+    expect(entries.some((row) => row.content === '수정된 한 줄')).toBe(true);
+    expect(desk.getSnapshot().notice).toContain('메모리를 수정했습니다');
+  });
+
+  it('removes an entry', async () => {
+    const { desk } = await ready();
+    const entry = desk.getSnapshot().memory.entries[0];
+    await expect(desk.removeMemory(entry)).resolves.toBe(true);
+    expect(desk.getSnapshot().memory.entries.some((row) => row.id === entry.id)).toBe(false);
+    expect(desk.getSnapshot().notice).toContain('memory.remove');
+  });
+
+  it('approves a pending write and rejects another', async () => {
+    const { desk } = await ready();
+    const pending = desk.getSnapshot().memory.entries.find((row) => row.status === 'pending');
+    expect(pending).toBeTruthy();
+    await expect(desk.approveMemory(pending!)).resolves.toBe(true);
+    expect(desk.getSnapshot().memory.entries.find((row) => row.id === pending!.id)?.status).toBe('active');
+
+    // a bot-scope write is an agent-shaped write — the gate holds it pending
+    await desk.setMemoryScope('bot', 'scribe');
+    expect(await desk.addMemory('에이전트가 남긴 메모')).toBe(true);
+    const next = desk.getSnapshot().memory.view.entries.find((row) => row.status === 'pending');
+    expect(next).toBeTruthy();
+    await expect(desk.rejectMemory(next!)).resolves.toBe(true);
+    expect(desk.getSnapshot().memory.view.entries.some((row) => row.id === next!.id)).toBe(false);
+  });
+
+  it('switches to a bot ledger without changing the injection source', async () => {
+    const { desk } = await ready();
+    await desk.setMemoryScope('bot', 'scribe');
+    const state = desk.getSnapshot();
+    expect(state.memory.view.scope).toBe('bot');
+    expect(state.memory.view.owner).toBe('scribe');
+    expect(state.memory.view.entries.length).toBeGreaterThan(0);
+    expect(state.memory.view.entries.every((row) => row.scope === 'bot' && row.owner === 'scribe')).toBe(true);
+    expect(state.memory.entries.every((row) => row.scope === 'user')).toBe(true);
+
+    await desk.setMemoryScope('user');
+    expect(desk.getSnapshot().memory.view.scope).toBe('user');
+  });
+
+  it('filters the panel without dropping entries from the ledger', async () => {
+    const { desk } = await ready();
+    const all = desk.getSnapshot().memory.entries.length;
+    desk.setMemoryQuery('JSON-RPC');
+    desk.setMemoryFilter('active');
+    const state = desk.getSnapshot();
+    expect(state.memory.query).toBe('JSON-RPC');
+    expect(state.memory.filter).toBe('active');
+    expect(state.memory.entries).toHaveLength(all);
+    const visible = filterMemory(state.memory.view.entries, { text: state.memory.query, filter: state.memory.filter });
+    expect(visible.map((row) => row.content).join(' ')).toContain('JSON-RPC');
+  });
+
+  it('reports the ledger as unsupported on a transport without one', async () => {
+    const fakeFetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'llama-3.1-8b' }] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+    const desk = new DeskController({
+      storage: new MemoryStorage(),
+      demo: new DemoTransport({ sleep: async () => undefined, now: () => 1000, random: () => 0.5 }),
+      fetchImpl: fakeFetch,
+    });
+    await desk.init();
+    await desk.connect('openai', 'http://fake.local');
+    expect(desk.getSnapshot().connection.transport).toBe('openai');
+    expect(desk.getSnapshot().memory.supported).toBe(false);
+    await expect(desk.addMemory('원장 없는 모드')).resolves.toBe(false);
+    expect(desk.getSnapshot().notice).toContain('원장');
+  });
+});
+
+describe('DeskController — session management', () => {
+  it('renames a conversation and the simulated session row', async () => {
+    const { desk, demo } = await ready();
+    const id = desk.getSnapshot().activeId!;
+    await expect(desk.renameConversation(id, '  새   이름 ')).resolves.toBe(true);
+    expect(desk.getSnapshot().conversations.find((row) => row.id === id)?.title).toBe('새 이름');
+    expect(demo.sessionsList(true).find((row) => row.sessionId === id)?.title).toBe('새 이름');
+  });
+
+  it('archives a conversation out of the list and restores it', async () => {
+    const { desk } = await ready();
+    const id = desk.getSnapshot().activeId!;
+    await desk.archiveConversation(id, true);
+    expect(desk.getSnapshot().activeId).toBeNull();
+    expect(desk.getSnapshot().conversations.find((row) => row.id === id)?.archived).toBe(true);
+    expect(filterConversations(desk.getSnapshot().conversations).some((row) => row.id === id)).toBe(false);
+    expect(filterConversations(desk.getSnapshot().conversations, { archived: true }).some((row) => row.id === id)).toBe(true);
+
+    await desk.archiveConversation(id, false);
+    expect(filterConversations(desk.getSnapshot().conversations).some((row) => row.id === id)).toBe(true);
+    expect(desk.getSnapshot().notice).toContain('보관을 풀었습니다');
+  });
+
+  it('deletes a conversation and its simulated session', async () => {
+    const { desk, demo } = await ready();
+    const id = desk.getSnapshot().activeId!;
+    await expect(desk.deleteConversation(id)).resolves.toBe(true);
+    expect(desk.getSnapshot().conversations.some((row) => row.id === id)).toBe(false);
+    expect(demo.sessionsList(true).some((row) => row.sessionId === id)).toBe(false);
+  });
+
+  it('searches the session list by title and by reply text', async () => {
+    const { desk } = await ready();
+    desk.setSessionQuery('SSE');
+    expect(filterConversations(desk.getSnapshot().conversations, { text: desk.getSnapshot().sessions.query }).map((row) => row.id)).toEqual([
+      'demo-conv-1',
+    ]);
+    desk.setSessionQuery('FrameSplitter');
+    expect(filterConversations(desk.getSnapshot().conversations, { text: desk.getSnapshot().sessions.query }).map((row) => row.id)).toEqual([
+      'demo-conv-1',
+    ]);
+    desk.setSessionQuery('없는 검색어');
+    expect(filterConversations(desk.getSnapshot().conversations, { text: desk.getSnapshot().sessions.query })).toHaveLength(0);
+  });
+
+  it('shows archived sessions only when the archive view is on', async () => {
+    const { desk } = await ready();
+    expect(desk.getSnapshot().sessions.showArchived).toBe(false);
+    desk.setShowArchived(true);
+    expect(desk.getSnapshot().sessions.showArchived).toBe(true);
+  });
+});
+
+describe('DeskController — export', () => {
+  it('exports the active conversation as markdown, then json', async () => {
+    const { desk } = await ready();
+    const id = desk.getSnapshot().activeId!;
+    const markdown = desk.exportConversation(id, 'markdown');
+    expect(markdown?.filename.endsWith('.md')).toBe(true);
+    expect(markdown?.content).toContain('# SSE 프레임 경계 처리');
+    expect(markdown?.content).toContain('## totals');
+    expect(markdown?.content).toContain('## memory ledger (active at export time)');
+    expect(desk.getSnapshot().notice).toContain('Markdown');
+
+    const json = desk.exportConversation(id, 'json');
+    const parsed = JSON.parse(json!.content) as { conversation: { id: string; messages: unknown[] }; totals: { messages: number } };
+    expect(parsed.conversation.id).toBe(id);
+    expect(parsed.totals.messages).toBe(2);
+    expect(desk.getSnapshot().notice).toContain('JSON');
+  });
+
+  it('refuses to export something that does not exist', async () => {
+    const { desk } = await ready();
+    expect(desk.exportConversation('missing', 'json')).toBeNull();
+    expect(desk.getSnapshot().notice).toContain('없습니다');
+  });
+
+  it('refuses to export an empty conversation', async () => {
+    const { desk } = await ready();
+    await desk.openDaemonSession({ sessionId: 'sess-empty', backend: 'claude', createdAt: 1 });
+    const empty = desk.getSnapshot().conversations.find((row) => row.daemonSessions.claude === 'sess-empty');
+    expect(empty).toBeTruthy();
+    expect(desk.exportConversation(empty!.id, 'markdown')).toBeNull();
+    expect(desk.getSnapshot().notice).toContain('메시지가 없어');
   });
 });

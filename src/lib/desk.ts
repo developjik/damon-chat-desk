@@ -9,6 +9,8 @@
 import { DaemonTransport, normalizeBaseUrl, type DaemonSessionRow } from './daemon';
 import { DEMO_ROUTES, DemoTransport, composeReply } from './demo';
 import { probe } from './detect';
+import { buildExport, type ExportFormat, type ExportPayload } from './export';
+import { memoryErrorInfo } from './memory';
 import { listModels, streamChat } from './openai';
 import { loadState, saveState, safeStorage, type SavedState } from './persistence';
 import { planStatusFor } from './plan';
@@ -20,6 +22,8 @@ import type {
   ConnectionState,
   Conversation,
   MemoryEntry,
+  MemoryFilter,
+  MemoryScope,
   PermissionAsk,
   PermissionAction,
   PlanDecision,
@@ -29,18 +33,41 @@ import type {
   TransportKind,
 } from './types';
 
+/** One ledger as the memory panel views it (user, or a bot by owner). */
+export interface MemoryView {
+  scope: MemoryScope;
+  owner?: string;
+  entries: MemoryEntry[];
+  chars: number;
+  limit: number;
+}
+
 export interface DeskState {
   connection: ConnectionState;
   conversations: Conversation[];
   activeId: string | null;
   daemonSessions: DaemonSessionRow[];
   memory: {
+    /** The user ledger — this is what gets injected into a prompt. */
     entries: MemoryEntry[];
     enabled: boolean;
     chars: number;
     limit: number;
     loading: boolean;
     error?: string;
+    /** The ledger the panel is reading and writing. */
+    view: MemoryView;
+    query: string;
+    filter: MemoryFilter;
+    /** A write is in flight. */
+    busy: boolean;
+    /** False when the transport has no ledger (OpenAI-compatible). */
+    supported: boolean;
+  };
+  /** Sidebar session search and the archive view. */
+  sessions: {
+    query: string;
+    showArchived: boolean;
   };
   compare: boolean;
   primaryKey: string | null;
@@ -109,7 +136,19 @@ export class DeskController {
       conversations: saved?.conversations ?? [],
       activeId: saved?.activeId ?? null,
       daemonSessions: [],
-      memory: { entries: [], enabled: saved?.settings.memoryEnabled ?? true, chars: 0, limit: 8000, loading: false },
+      memory: {
+        entries: [],
+        enabled: saved?.settings.memoryEnabled ?? true,
+        chars: 0,
+        limit: 8000,
+        loading: false,
+        view: { scope: 'user', entries: [], chars: 0, limit: 0 },
+        query: '',
+        filter: 'all',
+        busy: false,
+        supported: true,
+      },
+      sessions: { query: '', showArchived: false },
       compare: saved?.settings.compare ?? false,
       primaryKey: saved?.settings.primaryKey ?? null,
       secondaryKey: saved?.settings.secondaryKey ?? null,
@@ -243,13 +282,49 @@ export class DeskController {
       targets,
       probeNote: note ?? 'simulated daemon — no network, no keys',
     });
-    const memory = this.demo.memory(true);
-    this.set({
-      memory: { entries: memory, enabled: this.state.memory.enabled, chars: this.demo.memoryUsage().chars, limit: this.demo.memoryUsage().limit, loading: false },
-    });
+    const savedMemory = this.loadDemoMemory();
+    if (savedMemory) this.demo.hydrateMemory(savedMemory);
     this.ensureRouteSelection(targets);
     if (this.state.conversations.length === 0) this.seedDemoConversations();
+    this.syncDemoSessions();
+    await this.refreshMemory();
     this.persist();
+  }
+
+  private readonly demoMemoryKey = 'damon-desk.demo-memory.v1';
+
+  /** The demo ledger survives a reload; a real daemon keeps its own. */
+  private loadDemoMemory(): MemoryEntry[] | undefined {
+    try {
+      const raw = this.storage?.getItem(this.demoMemoryKey);
+      if (!raw) return undefined;
+      const parsed = JSON.parse(raw) as MemoryEntry[];
+      return Array.isArray(parsed) && parsed.length > 0 ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private saveDemoMemory(): void {
+    if (this.state.connection.transport !== 'demo' || !this.storage) return;
+    try {
+      this.storage.setItem(this.demoMemoryKey, JSON.stringify(this.demo.snapshotMemory()));
+    } catch {
+      /* quota — the in-memory ledger still works this session */
+    }
+  }
+
+  /** Mirror the conversation list into the simulated session ledger. */
+  private syncDemoSessions(): void {
+    for (const conversation of this.state.conversations) {
+      this.demo.addSession({
+        sessionId: conversation.id,
+        backend: this.state.connection.targets[0]?.provider ?? 'claude',
+        title: conversation.title,
+        createdAt: conversation.createdAt,
+        archived: conversation.archived === true,
+      });
+    }
   }
 
   private setStateConnection(connection: ConnectionState): void {
@@ -352,7 +427,7 @@ export class DeskController {
         probeNote: result.note ?? `${targets.length} models on /v1/models`,
       });
       this.ensureRouteSelection(targets);
-      this.set({ memory: { ...this.state.memory, entries: [], chars: 0, limit: 0 } });
+      this.set({ memory: { ...this.state.memory, entries: [], chars: 0, limit: 0, supported: false, view: this.emptyView('user') } });
       this.persist();
     } catch (error) {
       this.set({
@@ -364,25 +439,466 @@ export class DeskController {
   async refreshDaemonSessions(): Promise<void> {
     if (!this.daemon) return;
     try {
-      const sessions = await this.daemon.listSessions();
+      // Archived rows come back too — the sidebar decides what to show,
+      // and the archive view can restore a row without a second query.
+      const sessions = await this.daemon.listSessions(80, { includeArchived: true });
       this.set({ daemonSessions: sessions });
     } catch {
       /* listing is best-effort */
     }
   }
 
-  async refreshDaemonMemory(): Promise<void> {
-    if (!this.daemon) return;
+  /* ---------------------------------------------------------------- */
+  /* memory ledger — list / write / remove / approve                   */
+  /* ---------------------------------------------------------------- */
+
+  private emptyView(scope: MemoryScope, owner?: string): MemoryView {
+    return { scope, owner, entries: [], chars: 0, limit: 0 };
+  }
+
+  /**
+   * Read both ledgers that matter: the user ledger (the injection
+   * source, always) and whatever ledger the panel is looking at.
+   */
+  async refreshMemory(): Promise<void> {
+    const { scope, owner } = this.state.memory.view;
+    const transport = this.state.connection.transport;
+
+    if (transport === 'demo') {
+      const user = this.demo.memoryList({ scope: 'user', includePending: true });
+      const userUsage = this.demo.memoryUsage('user');
+      const viewEntries = scope === 'user' ? user : this.demo.memoryList({ scope, owner, includePending: true });
+      const viewUsage = scope === 'user' ? userUsage : this.demo.memoryUsage(scope, owner);
+      this.set({
+        memory: {
+          ...this.state.memory,
+          entries: user,
+          chars: userUsage.chars,
+          limit: userUsage.limit,
+          loading: false,
+          error: undefined,
+          supported: true,
+          view: { scope, owner, entries: viewEntries, chars: viewUsage.chars, limit: viewUsage.limit },
+        },
+      });
+      return;
+    }
+
+    if (transport !== 'daemon' || !this.daemon) {
+      this.set({
+        memory: {
+          ...this.state.memory,
+          entries: [],
+          chars: 0,
+          limit: 0,
+          loading: false,
+          supported: false,
+          view: this.emptyView(scope, owner),
+        },
+      });
+      return;
+    }
+
     this.set({ memory: { ...this.state.memory, loading: true } });
     try {
-      const entries = await this.daemon.memory(true);
-      const usage = await this.daemon.memoryUsage().catch(() => ({ chars: 0, limit: 0 }));
+      const user = await this.daemon.listMemory({ scope: 'user', includePending: true });
+      const usage = await this.daemon.memoryUsage('user').catch(() => ({ chars: 0, limit: 0 }));
+      let viewEntries = user;
+      let viewUsage = usage;
+      if (scope !== 'user') {
+        viewEntries = await this.daemon.listMemory({ scope, owner, includePending: true });
+        viewUsage = await this.daemon.memoryUsage(scope, owner).catch(() => ({ chars: 0, limit: 0 }));
+      }
       this.set({
-        memory: { entries, enabled: this.state.memory.enabled, chars: usage.chars, limit: usage.limit, loading: false },
+        memory: {
+          ...this.state.memory,
+          entries: user,
+          chars: usage.chars,
+          limit: usage.limit,
+          loading: false,
+          error: undefined,
+          supported: true,
+          view: { scope, owner, entries: viewEntries, chars: viewUsage.chars, limit: viewUsage.limit },
+        },
       });
     } catch (error) {
       this.set({ memory: { ...this.state.memory, loading: false, error: (error as Error).message } });
     }
+  }
+
+  /** Back-compat name — the panel calls `refreshMemory`. */
+  async refreshDaemonMemory(): Promise<void> {
+    await this.refreshMemory();
+  }
+
+  setMemoryQuery(query: string): void {
+    this.set({ memory: { ...this.state.memory, query } });
+  }
+
+  setMemoryFilter(filter: MemoryFilter): void {
+    this.set({ memory: { ...this.state.memory, filter } });
+  }
+
+  async setMemoryScope(scope: MemoryScope, owner?: string): Promise<void> {
+    const nextOwner = scope === 'bot' ? owner ?? this.state.memory.view.owner ?? 'scribe' : undefined;
+    const view = this.state.memory.view;
+    this.set({ memory: { ...this.state.memory, view: { ...view, scope, owner: nextOwner } } });
+    await this.refreshMemory();
+  }
+
+  private memoryTarget(): { scope: MemoryScope; owner?: string } {
+    const view = this.state.memory.view;
+    return { scope: view.scope, owner: view.scope === 'bot' ? view.owner : undefined };
+  }
+
+  private async writeLedger(content: string): Promise<'active' | 'pending'> {
+    const { scope, owner } = this.memoryTarget();
+    if (scope === 'bot' && !owner) throw new Error('봇 스코프에는 owner가 필요합니다');
+    const transport = this.state.connection.transport;
+    if (transport === 'demo') {
+      const result = this.demo.writeMemory({ scope, owner, content, source: 'desk' });
+      return result.status;
+    }
+    if (transport === 'daemon' && this.daemon) {
+      const result = await this.daemon.writeMemory({ scope, owner, content, source: 'desk' });
+      return result.status;
+    }
+    throw new Error('이 전송 계층에는 메모리 원장이 없습니다');
+  }
+
+  /** Add an entry to the ledger the panel is viewing (`memory.write`). */
+  async addMemory(content: string): Promise<boolean> {
+    const text = content.trim();
+    if (!text) return false;
+    this.set({ memory: { ...this.state.memory, busy: true, error: undefined } });
+    try {
+      const status = await this.writeLedger(text);
+      this.saveDemoMemory();
+      await this.refreshMemory();
+      this.set({
+        memory: { ...this.state.memory, busy: false },
+        notice: status === 'pending' ? '메모리 저장됨 — 승인 대기(pending)' : '메모리를 저장했습니다 (memory.write)',
+      });
+      return true;
+    } catch (error) {
+      const info = memoryErrorInfo(error);
+      this.set({ memory: { ...this.state.memory, busy: false, error: info.message }, notice: `메모리 저장 실패: ${info.message}` });
+      return false;
+    }
+  }
+
+  /**
+   * The ledger has no update verb: an edit is a write of the new text
+   * followed by a remove of the old id. If the remove fails the new
+   * entry still exists, so the notice says which half landed.
+   */
+  async updateMemory(entry: MemoryEntry, content: string): Promise<boolean> {
+    const text = content.trim();
+    if (!text) return false;
+    if (text === entry.content) return true;
+    this.set({ memory: { ...this.state.memory, busy: true, error: undefined } });
+    try {
+      const status = await this.writeLedger(text);
+      this.saveDemoMemory();
+      const removed = await this.removeMemoryEntry(entry);
+      await this.refreshMemory();
+      this.set({
+        memory: { ...this.state.memory, busy: false },
+        notice: removed
+          ? status === 'pending'
+            ? '메모리를 수정했습니다 — 승인 대기(pending)'
+            : '메모리를 수정했습니다'
+          : '새 내용은 저장됐지만 이전 항목을 지우지 못했습니다 — 중복을 확인하세요',
+      });
+      return true;
+    } catch (error) {
+      const info = memoryErrorInfo(error);
+      this.set({ memory: { ...this.state.memory, busy: false, error: info.message }, notice: `메모리 수정 실패: ${info.message}` });
+      return false;
+    }
+  }
+
+  private async removeMemoryEntry(entry: MemoryEntry): Promise<boolean> {
+    const transport = this.state.connection.transport;
+    if (transport === 'demo') return this.demo.removeMemory(entry.id);
+    if (transport === 'daemon' && this.daemon) return this.daemon.removeMemory(entry.id);
+    return false;
+  }
+
+  async removeMemory(entry: MemoryEntry): Promise<boolean> {
+    this.set({ memory: { ...this.state.memory, busy: true, error: undefined } });
+    try {
+      const removed = await this.removeMemoryEntry(entry);
+      this.saveDemoMemory();
+      await this.refreshMemory();
+      this.set({
+        memory: { ...this.state.memory, busy: false },
+        notice: removed ? '메모리를 삭제했습니다 (memory.remove)' : '이미 없는 항목입니다',
+      });
+      return removed;
+    } catch (error) {
+      const info = memoryErrorInfo(error);
+      this.set({ memory: { ...this.state.memory, busy: false, error: info.message }, notice: `메모리 삭제 실패: ${info.message}` });
+      return false;
+    }
+  }
+
+  private async settleMemory(entry: MemoryEntry, approve: boolean): Promise<boolean> {
+    const transport = this.state.connection.transport;
+    try {
+      const settled =
+        transport === 'demo'
+          ? approve
+            ? this.demo.approveMemory(entry.id)
+            : this.demo.rejectMemory(entry.id)
+          : transport === 'daemon' && this.daemon
+            ? await (approve ? this.daemon.approveMemory(entry.id) : this.daemon.rejectMemory(entry.id))
+            : false;
+      this.saveDemoMemory();
+      await this.refreshMemory();
+      this.set({
+        memory: { ...this.state.memory },
+        notice: settled
+          ? approve
+            ? '대기 항목을 승인했습니다 (memory.approve)'
+            : '대기 항목을 거절하고 지웠습니다 (memory.reject)'
+          : '다른 화면에서 이미 처리되었습니다',
+      });
+      return settled;
+    } catch (error) {
+      const info = memoryErrorInfo(error);
+      this.set({ notice: `메모리 처리 실패: ${info.message}` });
+      return false;
+    }
+  }
+
+  approveMemory(entry: MemoryEntry): Promise<boolean> {
+    return this.settleMemory(entry, true);
+  }
+
+  rejectMemory(entry: MemoryEntry): Promise<boolean> {
+    return this.settleMemory(entry, false);
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* session management — search, rename, archive, delete              */
+  /* ---------------------------------------------------------------- */
+
+  setSessionQuery(query: string): void {
+    this.set({ sessions: { ...this.state.sessions, query } });
+  }
+
+  setShowArchived(showArchived: boolean): void {
+    this.set({ sessions: { ...this.state.sessions, showArchived } });
+  }
+
+  private sessionIdOf(conversation: Conversation): string | undefined {
+    return Object.values(conversation.daemonSessions ?? {})[0];
+  }
+
+  /** The daemon row (or demo row) that holds this conversation's title. */
+  private remoteSessionId(conversation: Conversation): string | undefined {
+    const transport = this.state.connection.transport;
+    if (transport === 'demo') return conversation.id;
+    return this.sessionIdOf(conversation);
+  }
+
+  /** `session.rename` with a safe fallback when the daemon has no verb. */
+  async renameConversation(convId: string, title: string): Promise<boolean> {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) return false;
+    const next = title.replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!next) return false;
+    if (next === conversation.title) return true;
+    const previous = conversation.title;
+    this.patchConversation(convId, { title: next });
+    this.persist();
+
+    const sessionId = this.remoteSessionId(conversation);
+    try {
+      if (this.state.connection.transport === 'demo' && sessionId) {
+        this.demo.renameSession(sessionId, next);
+      } else if (this.state.connection.transport === 'daemon' && this.daemon && sessionId) {
+        await this.daemon.renameSession(sessionId, next);
+        void this.refreshDaemonSessions();
+      }
+      this.set({ notice: '세션 이름을 바꿨습니다' });
+      return true;
+    } catch (error) {
+      if (error instanceof RpcError && error.code === -32601) {
+        this.set({ notice: '데몬이 session.rename을 지원하지 않아 이 화면에만 반영했습니다' });
+        return true;
+      }
+      this.patchConversation(convId, { title: previous });
+      this.persist();
+      this.set({ notice: `이름 변경 실패: ${(error as Error).message}` });
+      return false;
+    }
+  }
+
+  /** Rename a row that only exists on the daemon (not yet opened here). */
+  async renameDaemonSession(row: DaemonSessionRow, title: string): Promise<boolean> {
+    const next = title.replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!next || next === row.title) return true;
+    if (!this.daemon) return false;
+    try {
+      await this.daemon.renameSession(row.sessionId, next);
+      for (const conversation of this.state.conversations) {
+        if (this.sessionIdOf(conversation) === row.sessionId) this.patchConversation(conversation.id, { title: next });
+      }
+      this.set({ notice: '세션 이름을 바꿨습니다 (session.rename)' });
+      await this.refreshDaemonSessions();
+      return true;
+    } catch (error) {
+      if (error instanceof RpcError && error.code === -32601) {
+        this.set({ notice: '데몬이 session.rename을 지원하지 않습니다' });
+        return false;
+      }
+      this.set({ notice: `이름 변경 실패: ${(error as Error).message}` });
+      return false;
+    }
+  }
+
+  /** Archive hides a session from the list without deleting its history. */
+  async archiveConversation(convId: string, archived = true): Promise<boolean> {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) return false;
+    this.patchConversation(convId, { archived });
+    if (archived && this.state.activeId === convId) this.set({ activeId: null });
+    this.persist();
+
+    const sessionId = this.remoteSessionId(conversation);
+    try {
+      if (this.state.connection.transport === 'demo' && sessionId) {
+        this.demo.setArchived(sessionId, archived);
+      } else if (this.state.connection.transport === 'daemon' && this.daemon && sessionId) {
+        await this.daemon.setSessionArchived(sessionId, archived);
+        void this.refreshDaemonSessions();
+      }
+      this.set({ notice: archived ? '보관함으로 옮겼습니다 — 목록에서 숨김' : '보관을 풀었습니다' });
+      return true;
+    } catch (error) {
+      if (error instanceof RpcError && error.code === -32601) {
+        this.set({ notice: '데몬이 session.set_archived를 지원하지 않아 이 화면에만 반영했습니다' });
+        return true;
+      }
+      this.patchConversation(convId, { archived: !archived });
+      this.persist();
+      this.set({ notice: `보관 실패: ${(error as Error).message}` });
+      return false;
+    }
+  }
+
+  /**
+   * Delete a conversation. A daemon-backed one deletes its session rows
+   * first (`session.delete`); a transport that does not know the verb
+   * only loses the local row, and the notice says so.
+   */
+  async deleteConversation(convId: string): Promise<boolean> {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) return false;
+    const sessionIds = Object.values(conversation.daemonSessions ?? {});
+    const transport = this.state.connection.transport;
+    let localOnly = false;
+
+    if (transport === 'demo') {
+      this.demo.deleteSession(conversation.id);
+    } else if (transport === 'daemon' && this.daemon && sessionIds.length > 0) {
+      try {
+        for (const sessionId of sessionIds) await this.daemon.deleteSession(sessionId);
+      } catch (error) {
+        if (error instanceof RpcError && error.code === -32601) {
+          localOnly = true;
+        } else {
+          this.set({ notice: `세션 삭제 실패: ${(error as Error).message}` });
+          return false;
+        }
+      }
+    }
+
+    this.set({
+      conversations: this.state.conversations.filter((entry) => entry.id !== convId),
+      activeId: this.state.activeId === convId ? null : this.state.activeId,
+    });
+    if (this.state.connection.transport === 'daemon') void this.refreshDaemonSessions();
+    this.persist();
+    this.set({ notice: localOnly ? '데몬이 session.delete를 지원하지 않아 이 화면에서만 지웠습니다' : '대화를 삭제했습니다' });
+    return true;
+  }
+
+  /** Delete a row that exists only on the daemon. */
+  async deleteDaemonSession(row: DaemonSessionRow): Promise<boolean> {
+    if (!this.daemon) return false;
+    try {
+      await this.daemon.deleteSession(row.sessionId);
+    } catch (error) {
+      this.set({ notice: `세션 삭제 실패: ${(error as Error).message}` });
+      return false;
+    }
+    const conversation = this.state.conversations.find((entry) => this.sessionIdOf(entry) === row.sessionId);
+    this.set({
+      conversations: conversation ? this.state.conversations.filter((entry) => entry.id !== conversation.id) : this.state.conversations,
+      activeId: conversation && this.state.activeId === conversation.id ? null : this.state.activeId,
+    });
+    this.persist();
+    await this.refreshDaemonSessions();
+    this.set({ notice: '데몬 세션을 삭제했습니다 (session.delete)' });
+    return true;
+  }
+
+  async archiveDaemonSession(row: DaemonSessionRow, archived = true): Promise<boolean> {
+    if (!this.daemon) return false;
+    try {
+      await this.daemon.setSessionArchived(row.sessionId, archived);
+    } catch (error) {
+      if (error instanceof RpcError && error.code === -32601) {
+        this.set({ notice: '데몬이 session.set_archived를 지원하지 않습니다' });
+        return false;
+      }
+      this.set({ notice: `보관 실패: ${(error as Error).message}` });
+      return false;
+    }
+    const conversation = this.state.conversations.find((entry) => this.sessionIdOf(entry) === row.sessionId);
+    if (conversation) this.patchConversation(conversation.id, { archived });
+    await this.refreshDaemonSessions();
+    this.set({ notice: archived ? '데몬 세션을 보관했습니다 (session.set_archived)' : '보관을 풀었습니다' });
+    return true;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* export — the transcript as a file                                 */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Build a Markdown/JSON export of one conversation. Pure read of the
+   * current state — the caller hands it to the download or clipboard.
+   */
+  exportConversation(convId: string, format: ExportFormat): ExportPayload | null {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) {
+      this.set({ notice: '내보낼 대화가 없습니다' });
+      return null;
+    }
+    if (conversation.messages.length === 0) {
+      this.set({ notice: '아직 메시지가 없어 내보낼 내용이 없습니다' });
+      return null;
+    }
+    const payload = buildExport(conversation, format, {
+      transport: this.state.connection.transport,
+      version: this.state.connection.version,
+      baseUrl: this.state.connection.baseUrl,
+      exportedAt: Date.now(),
+      memory: this.state.memory.enabled ? this.state.memory.entries : [],
+    });
+    this.set({
+      notice: `${format === 'markdown' ? 'Markdown' : 'JSON'} · ${payload.stats.messages}턴 · ${payload.stats.tools}개 툴 · ${(payload.stats.chars / 1024).toFixed(1)}KB`,
+    });
+    return payload;
+  }
+
+  /** Tell the user something the UI did outside the controller (copy/save). */
+  notify(message: string): void {
+    this.set({ notice: message });
   }
 
   async pairDevice(pairingKey: string, name: string): Promise<void> {
@@ -439,15 +955,6 @@ export class DeskController {
 
   openSidebar(open: boolean): void {
     this.set({ sidebarOpen: open });
-  }
-
-  deleteConversation(id: string): void {
-    const conversations = this.state.conversations.filter((conversation) => conversation.id !== id);
-    this.set({
-      conversations,
-      activeId: this.state.activeId === id ? null : this.state.activeId,
-    });
-    this.persist();
   }
 
   setCompare(compare: boolean): void {
@@ -581,11 +1088,22 @@ export class DeskController {
       slots,
     };
 
+    const title = conversation.messages.length === 0 ? titleOf(text) : conversation.title;
     this.patchConversation(conversation.id, {
       messages: [...conversation.messages, userMessage, assistantMessage],
       updatedAt: now,
-      title: conversation.messages.length === 0 ? titleOf(text) : conversation.title,
+      title,
     });
+    // The simulated ledger names a session by its conversation id, so the
+    // first prompt is what a demo `session.list` row gets called.
+    if (this.state.connection.transport === 'demo') {
+      this.demo.addSession({
+        sessionId: conversation.id,
+        backend: targets[0].provider,
+        title,
+        createdAt: conversation.createdAt,
+      });
+    }
     this.set({ busy: true, activeId: conversation.id });
     this.persist();
 
@@ -609,6 +1127,14 @@ export class DeskController {
       daemonSessions: {},
     };
     this.set({ conversations: [conversation, ...this.state.conversations], activeId: conversation.id });
+    if (this.state.connection.transport === 'demo') {
+      this.demo.addSession({
+        sessionId: conversation.id,
+        backend: this.state.connection.targets[0]?.provider ?? 'claude',
+        title: conversation.title,
+        createdAt: conversation.createdAt,
+      });
+    }
     return conversation;
   }
 
@@ -1170,12 +1696,14 @@ export class DeskController {
       createdAt: now - 1000 * 60 * 60 * 5,
       updatedAt: now - 1000 * 60 * 60 * 5,
       daemonSessions: {},
+      archived: true,
       messages: [{ id: 'demo-m5', role: 'user', text: seed3Prompt, createdAt: now - 1000 * 60 * 60 * 5, mode: 'single' }],
     };
     this.set({ conversations: [conv2, conv1, conv3], activeId: conv1.id });
     this.demo.seedSessions([
-      { sessionId: 'seed-1', backend: 'claude', title: 'damon-agent-core API 리뷰', createdAt: now - 1000 * 60 * 90 },
-      { sessionId: 'seed-2', backend: 'codex', title: 'assignment-map 수집기 복구', createdAt: now - 1000 * 60 * 220 },
+      { sessionId: conv1.id, backend: 'claude', title: conv1.title, createdAt: conv1.createdAt },
+      { sessionId: conv2.id, backend: 'codex', title: conv2.title, createdAt: conv2.createdAt },
+      { sessionId: conv3.id, backend: 'qwen', title: conv3.title, createdAt: conv3.createdAt, archived: true },
     ]);
   }
 }

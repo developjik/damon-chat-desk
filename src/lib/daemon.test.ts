@@ -7,7 +7,7 @@ import {
   mapUsage,
   normalizeBaseUrl,
 } from './daemon';
-import type { ServerEvent } from './rpc';
+import { RpcError, type ServerEvent } from './rpc';
 import { makeTarget } from './targets';
 import type { StreamEvent } from './types';
 
@@ -307,3 +307,122 @@ describe('mapSessionEvent — plan lifecycle', () => {
   });
 });
 
+
+function recordingRpc(transport: DaemonTransport, responses: Record<string, unknown> = {}) {
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const fakeRpc = {
+    onEvent: () => () => undefined,
+    request: (method: string, params: Record<string, unknown> = {}) => {
+      calls.push({ method, params });
+      const result = responses[method];
+      if (result instanceof Error) return Promise.reject(result);
+      return Promise.resolve(result ?? {});
+    },
+  };
+  (transport as unknown as { rpc: unknown }).rpc = fakeRpc;
+  return calls;
+}
+
+describe('DaemonTransport — memory ledger calls', () => {
+  it('lists the bot ledger with its owner, pending included', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'memory.list': { entries: [{ id: 'm1', scope: 'bot', content: 'x', status: 'active' }] } });
+    const entries = await transport.listMemory({ scope: 'bot', owner: 'scribe', includePending: true });
+    expect(entries).toHaveLength(1);
+    expect(calls[0]).toEqual({ method: 'memory.list', params: { scope: 'bot', owner: 'scribe', includePending: true } });
+  });
+
+  it('defaults to the user ledger and never sends an owner for it', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'memory.list': { entries: [] } });
+    await transport.listMemory();
+    expect(calls[0]).toEqual({ method: 'memory.list', params: { scope: 'user', includePending: false } });
+  });
+
+  it('writes with memory.write and reports the gate status', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'memory.write': { id: 'm9', status: 'pending' } });
+    const result = await transport.writeMemory({ scope: 'bot', owner: 'scribe', content: '릴리스 노트 순서', source: 'desk' });
+    expect(result).toEqual({ id: 'm9', status: 'pending' });
+    expect(calls[0]).toEqual({
+      method: 'memory.write',
+      params: { scope: 'bot', owner: 'scribe', content: '릴리스 노트 순서', source: 'desk' },
+    });
+  });
+
+  it('propagates the -32011 rejection untouched', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    recordingRpc(transport, {
+      'memory.write': new RpcError({ code: -32011, message: 'rejected', data: { kind: 'secret' } }),
+    });
+    await expect(transport.writeMemory({ scope: 'user', content: 'sk-1234567890abcdefghij' })).rejects.toMatchObject({
+      code: -32011,
+      data: { kind: 'secret' },
+    });
+  });
+
+  it('removes, approves and rejects by id', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, {
+      'memory.remove': { removed: true },
+      'memory.approve': { approved: true },
+      'memory.reject': { rejected: true },
+    });
+    await expect(transport.removeMemory('m1')).resolves.toBe(true);
+    await expect(transport.approveMemory('m2')).resolves.toBe(true);
+    await expect(transport.rejectMemory('m3')).resolves.toBe(true);
+    expect(calls.map((call) => [call.method, call.params])).toEqual([
+      ['memory.remove', { id: 'm1' }],
+      ['memory.approve', { id: 'm2' }],
+      ['memory.reject', { id: 'm3' }],
+    ]);
+  });
+
+  it('asks usage for the ledger it is viewing', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'memory.usage': { scope: 'bot', chars: 42, limit: 8000 } });
+    await expect(transport.memoryUsage('bot', 'scribe')).resolves.toEqual({ chars: 42, limit: 8000 });
+    expect(calls[0]).toEqual({ method: 'memory.usage', params: { scope: 'bot', owner: 'scribe' } });
+  });
+});
+
+describe('DaemonTransport — session management calls', () => {
+  it('lists sessions including archived rows when asked', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'session.list': { sessions: [{ sessionId: 's1', backend: 'claude', createdAt: 1 }] } });
+    const rows = await transport.listSessions(80, { includeArchived: true });
+    expect(rows).toHaveLength(1);
+    expect(calls[0]).toEqual({ method: 'session.list', params: { limit: 80, includeArchived: true } });
+  });
+
+  it('renames a session', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, { 'session.rename': { renamed: true } });
+    await expect(transport.renameSession('s1', 'API 리뷰')).resolves.toBe(true);
+    expect(calls[0]).toEqual({ method: 'session.rename', params: { sessionId: 's1', title: 'API 리뷰' } });
+  });
+
+  it('archives and deletes a session', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, {
+      'session.set_archived': { updated: true },
+      'session.delete': { deleted: true },
+    });
+    await expect(transport.setSessionArchived('s1', true)).resolves.toBe(true);
+    await expect(transport.deleteSession('s1')).resolves.toBe(true);
+    expect(calls).toEqual([
+      { method: 'session.set_archived', params: { sessionId: 's1', archived: true } },
+      { method: 'session.delete', params: { sessionId: 's1' } },
+    ]);
+  });
+
+  it('reads the daemon serialization through session.export', async () => {
+    const transport = new DaemonTransport({ baseUrl: 'http://127.0.0.1:9470' });
+    const calls = recordingRpc(transport, {
+      'session.export': { session: { sessionId: 's1', title: '리뷰' }, messages: [], usage: { turns: 2 } },
+    });
+    const exported = await transport.exportSession('s1');
+    expect(exported.session?.title).toBe('리뷰');
+    expect(calls[0]).toEqual({ method: 'session.export', params: { sessionId: 's1' } });
+  });
+});
