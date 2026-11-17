@@ -1,0 +1,64 @@
+# GitHub Pages 자동 배포 워크플로.
+#
+# 이 파일은 `.github/workflows/deploy.yml`로 옮겨야 동작한다.
+# (지금은 커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로
+#  푸시할 수 없다 — 웹 에디터에서 복사해 넣으면 그대로 동작한다.)
+#
+# Settings → Pages → Source: GitHub Actions 로 한 번 지정한 뒤,
+# main에 푸시할 때마다 테스트·빌드·배포가 돈다.
+#
+# 빌드 단계의 VITE_BASE_PATH가 이 리포의 Pages 경로(/damon-chat-desk/)를
+# vite base로 넘긴다 — 없으면 asset이 /assets/로 나가 404가 된다.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        env:
+          VITE_BASE_PATH: /damon-chat-desk/
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
