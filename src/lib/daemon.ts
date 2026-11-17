@@ -18,8 +18,10 @@
  */
 
 import { RpcClient, RpcError, rpcErrorHint, type HelloPayload, type ServerEvent, type SocketFactory, wsUrlFor } from './rpc';
-import type { ChatMessage, DaemonHealth, MemoryEntry, PermissionAsk, ReplySlot, RouteTarget, StreamEvent, Usage } from './types';
+import type { ChatMessage, DaemonHealth, MemoryEntry, PermissionAsk, PlanDecision, ReplySlot, RouteTarget, StreamEvent, Usage } from './types';
 import { makeTarget, targetKey } from './targets';
+import { buildPlan } from './plan';
+import { normalizeToolCall } from './tools';
 import { fetcher } from './http';
 
 export const BACKEND_TITLES: Record<string, string> = {
@@ -60,6 +62,19 @@ export interface DaemonConfig {
 export interface DaemonDeps {
   fetchImpl?: typeof fetch;
   socketFactory?: SocketFactory;
+}
+
+export interface DaemonPlanRow {
+  planId: string;
+  sessionId: string;
+  requestId?: string;
+  revision: number;
+  title?: string;
+  content?: string;
+  complete?: boolean;
+  status?: string;
+  decision?: string | null;
+  supersededBy?: string | null;
 }
 
 export interface DaemonSessionRow {
@@ -125,6 +140,43 @@ export function mapDaemonMessages(rows: StoredMessage[], target: RouteTarget): C
   return out;
 }
 
+/**
+ * The plan text of a `kind: plan` ask. claude's ExitPlanMode rides
+ * `input.plan`; a backend that normalizes it puts the same text on
+ * `detail.text` (`ToolCallDetail::Plan`).
+ */
+export function planTextOf(event: Record<string, unknown>): string {
+  const detail = event.detail;
+  if (detail && typeof detail === 'object') {
+    const record = detail as Record<string, unknown>;
+    if (typeof record.text === 'string' && record.text.trim()) return record.text;
+  }
+  const input = event.input;
+  if (typeof input === 'string' && input.trim()) return input;
+  if (input && typeof input === 'object') {
+    const record = input as Record<string, unknown>;
+    for (const key of ['plan', 'content', 'text', 'markdown', 'body']) {
+      if (typeof record[key] === 'string' && (record[key] as string).trim()) return record[key] as string;
+    }
+    try {
+      return JSON.stringify(input, null, 2);
+    } catch {
+      return '';
+    }
+  }
+  return typeof event.title === 'string' ? event.title : '';
+}
+
+export function planFromEvent(event: Record<string, unknown>) {
+  return buildPlan({
+    requestId: String(event.id ?? event.planId ?? ''),
+    content: planTextOf(event),
+    title: typeof event.title === 'string' ? event.title : undefined,
+    planId: typeof event.planId === 'string' ? event.planId : undefined,
+    revision: typeof event.revision === 'number' ? event.revision : undefined,
+  });
+}
+
 export function mapUsage(raw: unknown): Usage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const u = raw as Record<string, unknown>;
@@ -161,9 +213,9 @@ export function mapSessionEvent(data: unknown): StreamEvent | null {
         return text ? { type: 'delta', text } : null;
       }
       if (kind === 'tool_call') {
-        const name = typeof event.name === 'string' ? event.name : 'tool';
-        const status = typeof event.status === 'string' ? event.status : undefined;
-        return { type: 'tool', name, status };
+        // One snapshot per state change; the desk upserts by call id so
+        // `running` and `completed` frames land on the same row.
+        return { type: 'tool', call: normalizeToolCall(event) };
       }
       if (kind === 'error') {
         const text = typeof event.text === 'string' ? event.text : 'turn failed';
@@ -172,6 +224,9 @@ export function mapSessionEvent(data: unknown): StreamEvent | null {
       return null;
     }
     case 'permission_requested': {
+      if (String(event.kind ?? '') === 'plan') {
+        return { type: 'plan', plan: planFromEvent(event) };
+      }
       const ask: PermissionAsk = {
         id: String(event.id ?? ''),
         kind: String(event.kind ?? 'ask'),
@@ -189,6 +244,13 @@ export function mapSessionEvent(data: unknown): StreamEvent | null {
       };
       return { type: 'permission', ask };
     }
+    // Not a daemon wire name — a surface that names the plan event
+    // directly (and any future daemon that promotes it) still lands here.
+    case 'plan_requested':
+    case 'plan_review':
+      return { type: 'plan', plan: planFromEvent(event) };
+    case 'permission_resolved':
+      return typeof event.request_id === 'string' ? { type: 'plan_resolved', requestId: event.request_id } : null;
     case 'turn_completed':
       return { type: 'done', usage: mapUsage(event.usage) };
     case 'turn_canceled':
@@ -393,6 +455,50 @@ export class DaemonTransport {
 
   async cancelTurn(sessionId: string): Promise<void> {
     await this.client.request('turn.cancel', { sessionId }, 8000);
+  }
+
+  /**
+   * Redirect the turn that is already running. The daemon refuses this
+   * with -32002 when the backend cannot steer; callers queue the text as
+   * the next prompt instead.
+   */
+  async steer(sessionId: string, prompt: string): Promise<string> {
+    const result = await this.client.request<{ result?: string }>('turn.steer', { sessionId, prompt }, 20_000);
+    return typeof result?.result === 'string' ? result.result : '';
+  }
+
+  /** Copy a session (messages, tags, usage, resume handle) into a branch. */
+  async forkSession(sessionId: string, upto?: number): Promise<string> {
+    const params: Record<string, unknown> = { sessionId };
+    if (typeof upto === 'number') params.upto = upto;
+    const result = await this.client.request<{ sessionId?: string }>('session.fork', params, 25_000);
+    if (!result?.sessionId) throw new Error('session.fork returned no sessionId');
+    return result.sessionId;
+  }
+
+  /** Every revision of the session's plan reviews, chain-ordered. */
+  async listPlans(sessionId: string): Promise<DaemonPlanRow[]> {
+    const result = await this.client.request<{ plans?: DaemonPlanRow[] }>('plan.list', { sessionId }, 10_000);
+    return Array.isArray(result?.plans) ? result.plans : [];
+  }
+
+  /**
+   * Decide a durable plan review. `expectedRevision` is a CAS claim: a
+   * stale revision answers -32009 and nothing reaches the agent.
+   */
+  async respondPlan(input: {
+    planId: string;
+    expectedRevision: number;
+    decision: PlanDecision;
+    feedback?: string;
+  }): Promise<{ status?: string; applied?: boolean; revision?: number }> {
+    const params: Record<string, unknown> = {
+      planId: input.planId,
+      expectedRevision: input.expectedRevision,
+      decision: input.decision,
+    };
+    if (input.feedback) params.feedback = input.feedback;
+    return this.client.request('plan.respond', params, 20_000);
   }
 
   async respondPermission(sessionId: string, requestId: string, response: Record<string, unknown>): Promise<void> {

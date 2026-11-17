@@ -37,6 +37,106 @@ export interface Usage {
 
 export type SlotStatus = 'queued' | 'streaming' | 'done' | 'error' | 'canceled';
 
+/* ------------------------------------------------------------------ */
+/* tool calls — the daemon's ToolCallDetail, normalized                 */
+/* ------------------------------------------------------------------ */
+
+export type ToolStatus = 'running' | 'done' | 'error';
+
+export type ToolKind = 'shell' | 'read' | 'edit' | 'write' | 'search' | 'fetch' | 'task' | 'other';
+
+/** Whatever the call produced — one pane per field that exists. */
+export interface ToolResult {
+  /** shell stdout, file content, search hits, fetched body, subagent log */
+  stdout?: string;
+  stderr?: string;
+  /** unified diff for an edit */
+  diff?: string;
+  exitCode?: number;
+  error?: string;
+}
+
+/**
+ * One tool execution, in the shape the accordion renders it. The daemon
+ * emits a `timeline` `tool_call` per state change; the desk upserts by
+ * `id` so a call is one row from `running` to `done`.
+ */
+export interface ToolCall {
+  /** provider call id — the upsert key */
+  id: string;
+  name: string;
+  kind: ToolKind;
+  /** One-line subject: the command, path, query or url. */
+  label: string;
+  /** Full argument text shown when the row is open. */
+  input?: string;
+  status: ToolStatus;
+  startedAt: number;
+  endedAt?: number;
+  result?: ToolResult;
+  /** Raw normalized detail, kept verbatim for the `raw` pane. */
+  detail?: unknown;
+}
+
+/* ------------------------------------------------------------------ */
+/* steering — turn.steer while a reply is streaming                     */
+/* ------------------------------------------------------------------ */
+
+export interface SteerNote {
+  id: string;
+  text: string;
+  at: number;
+  /** `sent` once the transport accepted it, `failed` when it did not. */
+  state: 'sent' | 'failed';
+  /** The daemon's own acknowledgement, when it returned one. */
+  ack?: string;
+  error?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* plan review — permission ask of kind `plan` + plan.respond            */
+/* ------------------------------------------------------------------ */
+
+export type PlanDecision = 'approve' | 'request_changes' | 'defer';
+
+export type PlanStatus =
+  | 'awaiting_review'
+  | 'approved'
+  | 'changes_requested'
+  | 'deferred'
+  | 'expired'
+  | 'error';
+
+export interface PlanStep {
+  title: string;
+  detail?: string;
+}
+
+/**
+ * A plan the agent parked for review. `content` is the raw plan text;
+ * `steps`/`files`/`risks` are the structured read of it so the card can
+ * show what the agent proposes without a wall of prose.
+ */
+export interface PlanRequest {
+  /** permission request id — the live transport handle */
+  id: string;
+  /** durable review row (plan.list / plan.respond key) */
+  planId?: string;
+  revision?: number;
+  title: string;
+  content: string;
+  steps: PlanStep[];
+  files: string[];
+  risks: string[];
+  status: PlanStatus;
+  feedback?: string;
+  decidedAt?: number;
+  /** True while the decision is in flight. */
+  submitting?: boolean;
+  /** Why the last decision failed, if it did. */
+  error?: string;
+}
+
 /** One provider's answer inside a turn — a compare turn holds two. */
 export interface ReplySlot {
   id: string;
@@ -55,6 +155,12 @@ export interface ReplySlot {
   turnId?: string;
   /** A parked ask (tool approval, question) awaiting a decision. */
   ask?: PermissionAsk;
+  /** Tool executions in this reply, in call order. */
+  tools?: ToolCall[];
+  /** `turn.steer` instructions sent while this reply streamed. */
+  steers?: SteerNote[];
+  /** The plan the agent parked for review, when it asked for one. */
+  plan?: PlanRequest;
   /** Loaded from daemon history — no timing to report. */
   imported?: boolean;
 }
@@ -80,6 +186,8 @@ export interface Conversation {
   daemonSessions: Record<string, string>;
   /** True for conversations listed from the daemon that hold only a summary. */
   remote?: boolean;
+  /** The conversation this one was forked from (session.fork). */
+  forkedFrom?: string;
 }
 
 export interface DaemonHealth {
@@ -132,8 +240,13 @@ export type StreamEvent =
   | { type: 'start'; turnId?: string }
   | { type: 'delta'; text: string }
   | { type: 'notice'; text: string }
-  | { type: 'tool'; name: string; status?: string }
+  /** A tool call snapshot — upserted by `call.id`. */
+  | { type: 'tool'; call: ToolCall }
   | { type: 'permission'; ask: PermissionAsk }
+  | { type: 'plan'; plan: PlanRequest }
+  /** The parked ask was settled elsewhere — the card is no longer answerable. */
+  | { type: 'plan_resolved'; requestId: string }
+  | { type: 'steer'; text: string; at: number }
   | { type: 'usage'; usage: Usage }
   | { type: 'done'; stopReason?: string; usage?: Usage }
   | { type: 'error'; message: string };

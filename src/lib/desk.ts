@@ -11,7 +11,10 @@ import { DEMO_ROUTES, DemoTransport, composeReply } from './demo';
 import { probe } from './detect';
 import { listModels, streamChat } from './openai';
 import { loadState, saveState, safeStorage, type SavedState } from './persistence';
+import { planStatusFor } from './plan';
+import { RpcError } from './rpc';
 import { makeTarget } from './targets';
+import { mergeToolCall } from './tools';
 import type {
   ChatMessage,
   ConnectionState,
@@ -19,6 +22,7 @@ import type {
   MemoryEntry,
   PermissionAsk,
   PermissionAction,
+  PlanDecision,
   ReplySlot,
   RouteTarget,
   StreamEvent,
@@ -662,7 +666,11 @@ export class DeskController {
   ): Promise<AsyncGenerator<StreamEvent>> {
     const transport = this.state.connection.transport;
     if (transport === 'demo') {
-      return this.demo.streamTurn(outgoing, target, { signal, composeFrom: prompt });
+      return this.demo.streamTurn(outgoing, target, {
+        signal,
+        composeFrom: prompt,
+        steerKey: target.key,
+      });
     }
     if (transport === 'openai') {
       const conversation = this.state.conversations.find((entry) => entry.id === convId);
@@ -716,7 +724,54 @@ export class DeskController {
         );
         break;
       case 'tool':
-        this.patchSlot(convId, messageId, slotId, { notice: `tool · ${event.name}${event.status ? ` (${event.status})` : ''}` }, false);
+        this.patchSlot(
+          convId,
+          messageId,
+          slotId,
+          (slot) => {
+            const calls = slot.tools ?? [];
+            const at = calls.findIndex((call) => call.id === event.call.id);
+            return {
+              tools:
+                at >= 0
+                  ? calls.map((call, index) => (index === at ? mergeToolCall(call, event.call) : call))
+                  : [...calls, event.call],
+            };
+          },
+          false,
+        );
+        break;
+      case 'steer':
+        this.patchSlot(
+          convId,
+          messageId,
+          slotId,
+          (slot) => {
+            const notes = slot.steers ?? [];
+            // `steer()` already recorded the instruction; this is the
+            // transport's echo and must not double it.
+            if (notes.some((note) => note.text === event.text)) return {};
+            return { steers: [...notes, { id: uid('steer'), text: event.text, at: event.at, state: 'sent' as const }] };
+          },
+          false,
+        );
+        break;
+      case 'plan':
+        this.patchSlot(convId, messageId, slotId, (slot) => {
+          const existing = slot.plan;
+          if (existing && existing.id === event.plan.id && existing.status !== 'awaiting_review') {
+            return { plan: { ...event.plan, status: existing.status, feedback: existing.feedback, decidedAt: existing.decidedAt } };
+          }
+          return { plan: { ...event.plan }, notice: undefined, ask: undefined };
+        });
+        void this.hydratePlan(convId, messageId, slotId);
+        break;
+      case 'plan_resolved':
+        this.patchSlot(convId, messageId, slotId, (slot) => {
+          if (!slot.plan || slot.plan.id !== event.requestId) return {};
+          if (slot.plan.status !== 'awaiting_review') return {};
+          return { plan: { ...slot.plan, status: 'expired' as const } };
+        });
         break;
       case 'permission':
         this.patchSlot(convId, messageId, slotId, { ask: event.ask, notice: `승인 대기 · ${event.ask.name}` });
@@ -786,6 +841,260 @@ export class DeskController {
     } catch (error) {
       this.set({ notice: `응답 실패: ${(error as Error).message}` });
     }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* turn.steer — redirect a reply while it streams                     */
+  /* ---------------------------------------------------------------- */
+
+  private slotAt(convId: string, messageId: string, slotId: string): ReplySlot | undefined {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) return undefined;
+    const message = conversation.messages.find((entry) => entry.id === messageId);
+    return message?.slots?.find((entry) => entry.id === slotId);
+  }
+
+  /** Slots of the active conversation that are still receiving tokens. */
+  private liveSlots(): Array<{ messageId: string; slot: ReplySlot }> {
+    const conversation = this.state.conversations.find((entry) => entry.id === this.state.activeId);
+    if (!conversation) return [];
+    const out: Array<{ messageId: string; slot: ReplySlot }> = [];
+    for (const message of conversation.messages) {
+      for (const slot of message.slots ?? []) {
+        if (slot.status === 'streaming' || slot.status === 'queued') out.push({ messageId: message.id, slot });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Send a direction correction into the turn that is running now
+   * (`turn.steer`). The text is not a new prompt: it never opens a new
+   * user turn, and the reply keeps streaming into the same slot.
+   */
+  async steer(text: string): Promise<void> {
+    const body = text.trim();
+    if (!body) return;
+    const convId = this.state.activeId;
+    const live = this.liveSlots();
+    if (!convId || live.length === 0) {
+      this.set({ notice: '응답이 스트리밍되는 동안에만 방향 수정을 보낼 수 있습니다' });
+      return;
+    }
+    const transport = this.state.connection.transport;
+    for (const ref of live) {
+      const noteId = uid('steer');
+      const at = Date.now();
+      this.patchSlot(convId, ref.messageId, ref.slot.id, (slot) => ({
+        steers: [...(slot.steers ?? []), { id: noteId, text: body, at, state: 'sent' as const }],
+      }));
+      try {
+        if (transport === 'demo') {
+          this.demo.steer(body, ref.slot.target.key);
+          continue;
+        }
+        if (transport !== 'daemon' || !this.daemon) throw new Error('이 전송 계층은 방향 수정을 지원하지 않습니다');
+        if (!ref.slot.daemonSessionId) throw new Error('데몬 세션을 알 수 없습니다');
+        const ack = await this.daemon.steer(ref.slot.daemonSessionId, body);
+        if (ack) {
+          this.patchSlot(convId, ref.messageId, ref.slot.id, (slot) => ({
+            steers: (slot.steers ?? []).map((note) =>
+              note.id === noteId ? { ...note, ack } : note,
+            ),
+          }));
+        }
+      } catch (error) {
+        const message =
+          error instanceof RpcError && error.code === -32002
+            ? '이 백엔드는 턴 중 방향 수정을 지원하지 않습니다 — 다음 메시지로 반영됩니다'
+            : (error as Error).message;
+        this.patchSlot(convId, ref.messageId, ref.slot.id, (slot) => ({
+          steers: (slot.steers ?? []).map((note) =>
+            note.id === noteId ? { ...note, state: 'failed' as const, error: message } : note,
+          ),
+        }));
+        this.set({ notice: `steer 실패: ${message}` });
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* plan.respond — approve, revise or park a plan                      */
+  /* ---------------------------------------------------------------- */
+
+  /** Attach the durable review row (planId + revision) to a live ask. */
+  private async hydratePlan(convId: string, messageId: string, slotId: string): Promise<void> {
+    if (this.state.connection.transport !== 'daemon' || !this.daemon) return;
+    const slot = this.slotAt(convId, messageId, slotId);
+    const plan = slot?.plan;
+    const sessionId = slot?.daemonSessionId;
+    if (!plan || !sessionId) return;
+    try {
+      const rows = await this.daemon.listPlans(sessionId);
+      const row =
+        rows.find((entry) => entry.requestId === plan.id) ??
+        [...rows].reverse().find((entry) => entry.status === 'awaiting_review');
+      if (!row) return;
+      this.patchSlot(convId, messageId, slotId, (current) =>
+        current.plan && current.plan.id === plan.id
+          ? {
+              plan: {
+                ...current.plan,
+                planId: row.planId,
+                revision: row.revision,
+                content: row.content || current.plan.content,
+              },
+            }
+          : {},
+      );
+    } catch {
+      /* the live permission ask still answers — planId is optional then */
+    }
+  }
+
+  async respondPlan(
+    ref: { convId: string; messageId: string; slotId: string },
+    decision: PlanDecision,
+    feedback?: string,
+  ): Promise<void> {
+    const slot = this.slotAt(ref.convId, ref.messageId, ref.slotId);
+    const plan = slot?.plan;
+    if (!plan || plan.status !== 'awaiting_review') return;
+    const note = (feedback ?? '').trim();
+    if (decision === 'request_changes' && !note) {
+      this.patchSlot(ref.convId, ref.messageId, ref.slotId, (current) => ({
+        plan: current.plan ? { ...current.plan, error: '수정 요청에는 내용이 필요합니다' } : current.plan,
+      }));
+      return;
+    }
+
+    this.patchSlot(ref.convId, ref.messageId, ref.slotId, (current) => ({
+      plan: current.plan ? { ...current.plan, submitting: true, error: undefined } : current.plan,
+    }));
+
+    const transport = this.state.connection.transport;
+    try {
+      let reported: string | undefined;
+      let revision = plan.revision;
+      if (transport === 'demo') {
+        const result = await this.demo.respondPlan({
+          planId: plan.planId ?? plan.id,
+          revision: plan.revision,
+          decision,
+          feedback: note || undefined,
+        });
+        reported = result.status;
+        revision = result.revision;
+      } else if (transport === 'daemon' && this.daemon) {
+        if (plan.planId) {
+          try {
+            const result = await this.daemon.respondPlan({
+              planId: plan.planId,
+              expectedRevision: plan.revision ?? 1,
+              decision,
+              feedback: note || undefined,
+            });
+            reported = result?.status;
+            revision = result?.revision ?? revision;
+          } catch (error) {
+            if (error instanceof RpcError && error.code === -32009) {
+              // Another surface claimed the decision, or the revision moved.
+              const rows = await this.daemon.listPlans(slot?.daemonSessionId ?? '').catch(() => []);
+              const row = rows.find((entry) => entry.planId === plan.planId);
+              if (row) revision = row.revision;
+              throw new Error('다른 화면에서 먼저 결정되었습니다 — 최신 리비전으로 다시 시도하세요');
+            }
+            throw error;
+          }
+        } else {
+          // Pre-gate answer: the live ask is still the transport.
+          if (!slot?.daemonSessionId) throw new Error('계획 세션을 알 수 없습니다');
+          if (decision === 'defer') throw new Error('보류는 plan.respond로만 전달할 수 있습니다');
+          await this.daemon.respondPermission(slot.daemonSessionId, plan.id, {
+            behavior: decision === 'approve' ? 'allow' : 'deny',
+            ...(decision === 'request_changes' ? { message: note } : {}),
+          });
+          reported = decision === 'approve' ? 'approved' : 'changes_requested';
+        }
+      } else {
+        throw new Error('이 전송 계층은 계획 승인을 지원하지 않습니다');
+      }
+
+      const status = planStatusFor(decision, reported);
+      this.patchSlot(ref.convId, ref.messageId, ref.slotId, (current) =>
+        current.plan
+          ? {
+              plan: {
+                ...current.plan,
+                status,
+                revision,
+                submitting: false,
+                feedback: note || undefined,
+                decidedAt: Date.now(),
+                error: undefined,
+              },
+            }
+          : {},
+      );
+      this.set({ notice: `계획 ${status === 'approved' ? '승인' : status === 'deferred' ? '보류' : '수정 요청'} 전달됨` });
+      this.persist();
+    } catch (error) {
+      const message = (error as Error).message;
+      this.patchSlot(ref.convId, ref.messageId, ref.slotId, (current) => ({
+        plan: current.plan ? { ...current.plan, submitting: false, error: message } : current.plan,
+      }));
+      this.set({ notice: `계획 응답 실패: ${message}` });
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* session.fork — branch the conversation at a turn                   */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Fork the conversation at an assistant turn. The daemon copies the
+   * session (messages, tags, usage, resume handle) and the desk opens the
+   * copy as a new conversation, so the original keeps running untouched.
+   */
+  async forkAt(convId: string, messageId: string): Promise<void> {
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!conversation) return;
+    const index = conversation.messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    const messages = conversation.messages.slice(0, index + 1);
+    const slots = [...messages].reverse().flatMap((message) => message.slots ?? []);
+    const provider = slots[0]?.target.provider;
+    const sourceSession = slots.find((slot) => slot.daemonSessionId)?.daemonSessionId;
+    const transport = this.state.connection.transport;
+
+    let sessionId: string | undefined;
+    try {
+      if (transport === 'demo') {
+        sessionId = this.demo.forkSession(sourceSession, conversation.title);
+      } else if (transport === 'daemon' && this.daemon) {
+        if (!sourceSession) throw new Error('이 턴에는 데몬 세션이 없습니다 — 한 번 답한 뒤 분기할 수 있습니다');
+        sessionId = await this.daemon.forkSession(sourceSession);
+      } else {
+        throw new Error('이 전송 계층에는 분기할 세션이 없습니다');
+      }
+    } catch (error) {
+      this.set({ notice: `분기 실패: ${(error as Error).message}` });
+      return;
+    }
+
+    const branch: Conversation = {
+      id: uid('conv'),
+      title: `${conversation.title} (fork)`,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: messages.map((message) => ({ ...message, slots: message.slots?.map((slot) => ({ ...slot })) })),
+      daemonSessions: provider && sessionId ? { [provider]: sessionId } : {},
+      forkedFrom: conversation.id,
+    };
+    this.set({ conversations: [branch, ...this.state.conversations], activeId: branch.id, sidebarOpen: false });
+    this.persist();
+    if (transport === 'daemon') void this.refreshDaemonSessions();
+    this.set({ notice: `분기 세션 생성 · ${(sessionId ?? '').slice(0, 12)}` });
   }
 
   /* ---------------------------------------------------------------- */

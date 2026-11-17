@@ -8,11 +8,17 @@ docs/protocol-v2.md):
   POST /v1/pair         -> {deviceId, token, status}
   POST /v1/pair/status  -> {status}
   GET  /ws?ticket=...   -> JSON-RPC v2: hello, session.list, session.create,
-                           session.messages, catalog.models, memory.list,
-                           memory.usage, turn.start (streams session.event)
+                           session.messages, session.fork, catalog.models,
+                           memory.list, memory.usage,
+                           turn.start (streams session.event), turn.steer,
+                           turn.cancel,
+                           plan.list, plan.respond, permission.respond
 
 It is a test double: replies are canned, but the frames and the error
-codes are shaped exactly like the real daemon's.
+codes are shaped exactly like the real daemon's. A turn streams text,
+runs two tool calls (one shell pass, one edit with a diff), and — for a
+design ask — parks a `kind: plan` review that stays blocked until
+`plan.respond` decides it, the same way the daemon gates ExitPlanMode.
 """
 import asyncio
 import json
@@ -46,7 +52,25 @@ DELTAS = [
     "이 순서면 UI에 프로바이더 분기가 생기지 않습니다.",
 ]
 
+PLAN_TEXT = """## 데몬 이벤트 렌더러 구현 계획
+
+1. **이벤트 계약 고정** — session.event의 StreamEvent 타입을 먼저 못 박습니다.
+2. **얇은 경로** — turn.start → session.event → 렌더 한 줄기만 연결합니다.
+3. **상태 이전** — 세션·메모리를 데몬에 두고 UI는 렌더만 합니다.
+
+변경 예상 파일: `src/lib/daemon.ts`, `src/lib/desk.ts`, `src/components/Transcript.tsx`
+
+리스크: 세션 상태를 UI에 두면 두 번째 서피스가 다른 진실을 그립니다.
+"""
+
 COUNTER = {"n": 1}
+# requestId -> {"sessionId", "rid", "planId", "revision", "waiter", "decision", "feedback"}
+PENDING = {}
+STEERS = []
+
+
+def plan_intent(prompt):
+    return any(word in prompt for word in ("계획", "순서", "설계", "plan", "roadmap"))
 
 
 async def health(request):
@@ -90,20 +114,86 @@ async def ws_handler(request):
     async def send_event(session_id, payload):
         await ws.send_str(json.dumps({"event": "session.event", "sessionId": session_id, "data": payload}))
 
-    async def run_turn(session_id, prompt, rid):
+    async def stream_events(session_id, prompt):
         await asyncio.sleep(0.05)
         await send_event(session_id, {"turn_id": "t1", "type": "turn_started"})
-        for delta in DELTAS:
+        for index, delta in enumerate(DELTAS):
             await asyncio.sleep(0.05)
+            if STEERS:
+                for steered in STEERS:
+                    await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "assistant_message",
+                                                  "text": f"\n\n> {steered} — 반영했습니다.\n\n"})
+                STEERS.clear()
             await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "assistant_message", "text": delta})
+            if index == 2:
+                await run_shell_tool(session_id)
+            if index == 4:
+                await run_edit_tool(session_id)
+
+    async def complete_turn(session_id, rid):
         await send_event(session_id, {"turn_id": "t1", "type": "turn_completed",
                                       "usage": {"input_tokens": 128, "output_tokens": 96, "cost_usd": 0.0021,
                                                 "context_used": 3120, "context_window": 200000}})
         await ws.send_str(json.dumps({"id": rid, "result": {"turnId": "t1", "stopReason": "completed",
-                                                                     "usage": {"input_tokens": 128, "output_tokens": 96,
-                                                                               "cost_usd": 0.0021}}}))
+                                                             "usage": {"input_tokens": 128, "output_tokens": 96,
+                                                                       "cost_usd": 0.0021}}}))
         MESSAGES.setdefault(session_id, []).append({"id": 90, "role": "assistant", "ts": 1763000009000,
                                                     "data": {"content": "".join(DELTAS)}})
+
+    async def run_shell_tool(session_id):
+        call_id = f"call-{COUNTER['n']}"
+        COUNTER["n"] += 1
+        await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "tool_call",
+                                      "call_id": call_id, "name": "Bash", "status": "running",
+                                      "detail": {"type": "shell", "command": "npm test -- --run"}})
+        await asyncio.sleep(0.2)
+        await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "tool_call",
+                                      "call_id": call_id, "name": "Bash", "status": "completed",
+                                      "detail": {"type": "shell", "command": "npm test -- --run",
+                                                 "output": " ✓ src/lib/rpc.test.ts (9 tests)\n ✓ src/lib/desk.test.ts (18 tests)\n\n Tests  27 passed (27)",
+                                                 "exit_code": 0}})
+
+    async def run_edit_tool(session_id):
+        call_id = f"call-{COUNTER['n']}"
+        COUNTER["n"] += 1
+        await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "tool_call",
+                                      "call_id": call_id, "name": "Edit", "status": "running",
+                                      "detail": {"type": "edit", "path": "src/lib/daemon.ts"}})
+        await asyncio.sleep(0.25)
+        await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "tool_call",
+                                      "call_id": call_id, "name": "Edit", "status": "completed",
+                                      "detail": {"type": "edit", "path": "src/lib/daemon.ts",
+                                                 "unified_diff": "--- a/src/lib/daemon.ts\n+++ b/src/lib/daemon.ts\n@@ -196,3 +196,7 @@\n-  async *streamTurn(sessionId: string, prompt: string) {\n+  async *streamTurn(sessionId: string, prompt: string) {\n+    // steer arrives on the same socket, mid-turn\n"}})
+
+    async def run_turn(session_id, prompt, rid):
+        await stream_events(session_id, prompt)
+        if not plan_intent(prompt):
+            await complete_turn(session_id, rid)
+            return
+
+        # A design ask parks a durable review; the turn stays open until a
+        # decision reaches plan.respond through this or another surface.
+        COUNTER["n"] += 1
+        plan_id = f"plan-{COUNTER['n']}"
+        request_id = f"req-plan-{COUNTER['n']}"
+        PENDING[request_id] = {"sessionId": session_id, "rid": rid, "planId": plan_id, "revision": 1,
+                               "waiter": asyncio.Event(), "decision": None, "feedback": None}
+        await send_event(session_id, {"turn_id": "t1", "type": "permission_requested",
+                                      "id": request_id, "kind": "plan", "name": "ExitPlanMode",
+                                      "title": "데몬 이벤트 렌더러 구현 계획", "input": {"plan": PLAN_TEXT},
+                                      "detail": {"type": "plan", "text": PLAN_TEXT},
+                                      "actions": [{"id": "allow", "label": "Allow", "behavior": "allow", "variant": "primary"},
+                                                  {"id": "deny", "label": "Deny", "behavior": "deny"}]})
+        await PENDING[request_id]["waiter"].wait()
+        entry = PENDING.pop(request_id)
+        await send_event(session_id, {"turn_id": "t1", "type": "permission_resolved", "request_id": request_id})
+        if entry["decision"] == "approve":
+            await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "assistant_message",
+                                          "text": "\n\n승인됨 — 계획대로 구현을 시작합니다."})
+        elif entry["decision"] == "request_changes":
+            await send_event(session_id, {"turn_id": "t1", "type": "timeline", "kind": "assistant_message",
+                                          "text": f"\n\n수정 요청 접수: {entry['feedback']}"})
+        await complete_turn(session_id, rid)
 
     async for msg in ws:
         if msg.type != web.WSMsgType.TEXT:
@@ -126,6 +216,17 @@ async def ws_handler(request):
             await ws.send_str(json.dumps({"id": rid, "result": {"sessionId": sid, "backend": params.get("backend", "claude"), "replayed": 0}}))
         elif method == "session.messages":
             await ws.send_str(json.dumps({"id": rid, "result": {"messages": MESSAGES.get(params.get("sessionId"), [])}}))
+        elif method == "session.fork":
+            source = params.get("sessionId")
+            sid = "sess-fork-" + str(COUNTER["n"])
+            COUNTER["n"] += 1
+            existing = next((row for row in SESSIONS if row["sessionId"] == source), None)
+            SESSIONS.insert(0, {"sessionId": sid, "createdAt": 1763000600000,
+                                "backend": (existing or {}).get("backend", "claude"),
+                                "title": ((existing or {}).get("title") or "세션") + " (fork)",
+                                "cwd": (existing or {}).get("cwd"), "tags": [], "pinned": False, "archived": False})
+            MESSAGES[sid] = list(MESSAGES.get(source, []))
+            await ws.send_str(json.dumps({"id": rid, "result": {"sessionId": sid, "backend": (existing or {}).get("backend", "claude"), "replayed": 0}}))
         elif method == "catalog.models":
             backend = params.get("backend")
             models = {
@@ -141,9 +242,48 @@ async def ws_handler(request):
         elif method == "memory.usage":
             await ws.send_str(json.dumps({"id": rid, "result": {"scope": "user", "chars": 96, "limit": 8000}}))
         elif method == "turn.start":
-            asyncio.create_task(run_turn(params.get("sessionId"), params.get("prompt"), rid))
+            asyncio.create_task(run_turn(params.get("sessionId"), params.get("prompt", ""), rid))
+        elif method == "turn.steer":
+            STEERS.append(params.get("prompt", ""))
+            await ws.send_str(json.dumps({"id": rid, "result": {"result": "steering the running turn"}}))
         elif method == "turn.cancel":
             await ws.send_str(json.dumps({"id": rid, "result": {"cancelled": True}}))
+        elif method == "plan.list":
+            session_id = params.get("sessionId")
+            plans = [{"planId": entry["planId"], "sessionId": session_id, "requestId": request_id,
+                      "revision": entry["revision"], "title": "데몬 이벤트 렌더러 구현 계획",
+                      "content": PLAN_TEXT, "complete": True, "status": "awaiting_review"}
+                     for request_id, entry in PENDING.items() if entry["sessionId"] == session_id]
+            await ws.send_str(json.dumps({"id": rid, "result": {"plans": plans}}))
+        elif method == "plan.respond":
+            entry = next((row for row in PENDING.values() if row["planId"] == params.get("planId")), None)
+            if entry is None:
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32009, "message": "plan conflict: stale revision or closed plan"}}))
+            elif params.get("expectedRevision") != entry["revision"]:
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32009, "message": "plan conflict: expectedRevision stale"}}))
+            elif params.get("decision") == "request_changes" and not params.get("feedback"):
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32602, "message": "feedback required"}}))
+            else:
+                decision = params.get("decision")
+                entry["decision"] = "approve" if decision == "approve" else decision
+                entry["feedback"] = params.get("feedback")
+                status = {"approve": "approved", "request_changes": "changes_requested", "defer": "deferred"}[decision]
+                if decision == "request_changes":
+                    entry["revision"] += 1
+                entry["waiter"].set()
+                await ws.send_str(json.dumps({"id": rid, "result": {
+                    "recorded": True, "status": status, "applied": decision != "defer",
+                    "planId": entry["planId"], "revision": entry["revision"]}}))
+        elif method == "permission.respond":
+            entry = PENDING.get(params.get("requestId"))
+            if entry is None:
+                await ws.send_str(json.dumps({"id": rid, "error": {"code": -32008, "message": "ask not found"}}))
+            else:
+                behavior = (params.get("response") or {}).get("behavior", "deny")
+                entry["decision"] = "approve" if behavior == "allow" else "request_changes"
+                entry["feedback"] = (params.get("response") or {}).get("message")
+                entry["waiter"].set()
+                await ws.send_str(json.dumps({"id": rid, "result": {"responded": True}}))
         else:
             await ws.send_str(json.dumps({"id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}}))
     return ws

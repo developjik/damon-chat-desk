@@ -255,4 +255,111 @@ describe('stream event folding', () => {
     const conversation = desk.getSnapshot().conversations.find((entry) => entry.id === desk.getSnapshot().activeId);
     expect(conversation?.messages[1].slots?.[0].text).toBe(expected);
   });
+
+  it('folds tool snapshots into one row per call', async () => {
+    const { desk } = await ready();
+    desk.newConversation();
+    await desk.send('SSE 파서 버그 잡아줘');
+    const conversation = activeConversation(desk);
+    const tools = conversation.messages[1].slots?.[0].tools ?? [];
+    expect(tools).toHaveLength(4);
+    expect(new Set(tools.map((call) => call.id)).size).toBe(4);
+    expect(tools[0].status).toBe('error');
+    expect(tools[3].result?.exitCode).toBe(0);
+  });
+});
+
+function activeConversation(desk: DeskController) {
+  const state = desk.getSnapshot();
+  const conversation = state.conversations.find((entry) => entry.id === state.activeId);
+  if (!conversation) throw new Error('no active conversation');
+  return conversation;
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!check()) {
+    if (Date.now() - started > timeoutMs) throw new Error('condition timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe('DeskController — turn.steer', () => {
+  it('sends a direction correction into the running turn', async () => {
+    const demo = new DemoTransport({ sleep: () => new Promise((resolve) => setTimeout(resolve, 2)) });
+    const desk = new DeskController({ storage: new MemoryStorage(), demo });
+    await desk.init();
+    desk.newConversation();
+    const sending = desk.send('스트리밍과 배치 중 뭐가 나아?');
+    await waitFor(() => activeConversation(desk).messages[1]?.slots?.[0]?.status === 'streaming');
+    await desk.steer('비용 쪽을 더 봐줘');
+    await sending;
+
+    const slot = activeConversation(desk).messages[1].slots?.[0];
+    expect(slot?.steers?.[0]).toMatchObject({ text: '비용 쪽을 더 봐줘', state: 'sent' });
+    // the demo acknowledged it inside the answer
+    expect(slot?.text).toContain('비용 쪽을 더 봐줘');
+    // a steer never opens a new user turn
+    expect(activeConversation(desk).messages.filter((message) => message.role === 'user')).toHaveLength(1);
+  });
+
+  it('refuses to steer when no reply is streaming', async () => {
+    const { desk } = await ready();
+    await desk.steer('방향 수정');
+    expect(desk.getSnapshot().notice).toContain('스트리밍');
+    expect(activeConversation(desk).messages.flatMap((message) => message.slots ?? []).every((slot) => !slot.steers)).toBe(true);
+  });
+});
+
+describe('DeskController — plan.respond', () => {
+  it('records an approved plan on the slot', async () => {
+    const { desk } = await ready();
+    desk.newConversation();
+    await desk.send('구현 순서를 잡아줘');
+    const conversation = activeConversation(desk);
+    const message = conversation.messages[1];
+    const slot = message.slots![0];
+    expect(slot.plan?.status).toBe('awaiting_review');
+
+    await desk.respondPlan({ convId: conversation.id, messageId: message.id, slotId: slot.id }, 'approve');
+    const updated = activeConversation(desk).messages[1].slots![0];
+    expect(updated.plan?.status).toBe('approved');
+    expect(updated.plan?.decidedAt).toBeGreaterThan(0);
+    expect(desk.getSnapshot().notice).toContain('승인');
+  });
+
+  it('needs a reason before requesting changes', async () => {
+    const { desk } = await ready();
+    desk.newConversation();
+    await desk.send('구현 순서를 잡아줘');
+    const conversation = activeConversation(desk);
+    const message = conversation.messages[1];
+    const slot = message.slots![0];
+    await desk.respondPlan({ convId: conversation.id, messageId: message.id, slotId: slot.id }, 'request_changes');
+    const updated = activeConversation(desk).messages[1].slots![0];
+    expect(updated.plan?.status).toBe('awaiting_review');
+    expect(updated.plan?.error).toContain('수정 요청');
+  });
+});
+
+describe('DeskController — session.fork', () => {
+  it('opens the branch as a new conversation and leaves the original intact', async () => {
+    const { desk } = await ready();
+    desk.newConversation();
+    await desk.send('SSE 프레임 경계 처리');
+    const source = activeConversation(desk);
+    const assistant = source.messages[1];
+
+    await desk.forkAt(source.id, assistant.id);
+    const branch = activeConversation(desk);
+    expect(branch.id).not.toBe(source.id);
+    expect(branch.title).toBe(`${source.title} (fork)`);
+    expect(branch.forkedFrom).toBe(source.id);
+    expect(branch.messages).toHaveLength(2);
+    expect(branch.daemonSessions.claude).toMatch(/^demo-fork-/);
+
+    const original = desk.getSnapshot().conversations.find((entry) => entry.id === source.id);
+    expect(original?.messages).toHaveLength(2);
+    expect(desk.getSnapshot().notice).toContain('분기');
+  });
 });

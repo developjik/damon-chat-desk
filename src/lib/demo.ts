@@ -8,8 +8,9 @@
  * demo branch: the badge says "simulated" and nothing else changes.
  */
 
-import type { MemoryEntry, ReplySlot, RouteTarget, StreamEvent } from './types';
+import type { MemoryEntry, PlanDecision, PlanRequest, ReplySlot, RouteTarget, StreamEvent, ToolCall, ToolResult } from './types';
 import { makeTarget } from './targets';
+import { buildPlan } from './plan';
 
 interface DemoProfile {
   provider: string;
@@ -262,6 +263,237 @@ export function composeReply(prompt: string, target: RouteTarget): string {
   return codeReply(detectIntent(prompt), prompt, profile.style);
 }
 
+/* ------------------------------------------------------------------ */
+/* tool scripts — a realistic run for the accordion                     */
+/* ------------------------------------------------------------------ */
+
+interface DemoToolScript {
+  name: string;
+  kind: ToolCall['kind'];
+  label: string;
+  input: string;
+  status: 'done' | 'error';
+  /** Wall-clock cost the daemon would report for this call. */
+  ms: number;
+  result: ToolResult;
+}
+
+/** Per-backend tool vocabulary, so a demo log matches the provider. */
+const TOOL_NAMES: Record<string, Partial<Record<ToolCall['kind'], string>>> = {
+  claude: { shell: 'Bash', read: 'Read', edit: 'Edit', search: 'Grep' },
+  codex: { shell: 'shell', read: 'read', edit: 'apply_patch', search: 'search' },
+  qwen: { shell: 'bash', read: 'read_file', edit: 'edit_file', search: 'grep' },
+  opencode: { shell: 'bash', read: 'read', edit: 'edit', search: 'grep' },
+};
+
+function toolName(target: RouteTarget, kind: ToolCall['kind']): string {
+  return TOOL_NAMES[target.provider]?.[kind] ?? kind;
+}
+
+const FAILING_TEST = `> damon-chat-desk@0.1.0 test
+> vitest run src/lib/sse.test.ts
+
+ ❯ src/lib/sse.test.ts (6 tests | 1 failed) 214ms
+   ✓ flushes the trailing frame
+   × keeps a half frame until the next chunk
+     → expected [] to deeply equal [ 'data: {a:1}' ]
+
+ FAIL  src/lib/sse.test.ts > keeps a half frame until the next chunk
+ AssertionError: expected [] to deeply equal [ 'data: {a:1}' ]
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 5 passed (6)`;
+
+const PASSING_TEST = `> damon-chat-desk@0.1.0 test
+> vitest run src/lib/sse.test.ts
+
+ ✓ src/lib/sse.test.ts (6 tests) 198ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)`;
+
+const SSE_SOURCE = ` 31  const REST = '\\r\\n\\r\\n';
+ 32
+ 33  export function splitFrames(buffer: string): { frames: string[]; rest: string } {
+ 34    const frames: string[] = [];
+ 35    let at = buffer.indexOf('\\n\\n');
+ 36    while (at !== -1) {
+ 37      frames.push(buffer.slice(0, at));
+ 38      buffer = buffer.slice(at + 2);
+ 39      at = buffer.indexOf('\\n\\n');
+ 40    }
+ 41    return { frames, rest: buffer };
+ 42  }`;
+
+const SSE_DIFF = `--- a/src/lib/sse.ts
++++ b/src/lib/sse.ts
+@@ -1,6 +1,7 @@
+-const SEPARATOR = '\\n\\n';
++const SEPARATORS = ['\\n\\n', '\\r\\n\\r\\n'];
+ 
+-export function splitFrames(buffer: string) {
++export function splitFrames(buffer: string) {
+   const frames: string[] = [];
+   let at = indexOfSeparator(buffer, 0);`;
+
+const SEARCH_HITS = `src/lib/sse.ts:41:export function splitFrames(buffer: string)
+src/lib/desk.ts:512:    const events = await this.eventsFor(convId, target, …)
+src/lib/daemon.ts:196:  async *streamTurn(sessionId: string, prompt: string, …)`;
+
+const PLAN_FILES = ` 1  {
+ 2    "name": "damon-chat-desk",
+ 3    "scripts": {
+ 4      "build": "tsc --noEmit && vite build",
+ 5      "test": "vitest run"
+ 6    },
+ 7    "dependencies": { "react": "19.3.1" }
+ 8  }`;
+
+/** One snapshot of a scripted call, in the wire shape the desk folds. */
+function scriptCall(
+  script: DemoToolScript,
+  id: string,
+  startedAt: number,
+  status: ToolCall['status'],
+  endedAt?: number,
+): ToolCall {
+  return {
+    id,
+    name: script.name,
+    kind: script.kind,
+    label: script.label,
+    input: script.input,
+    status,
+    startedAt,
+    endedAt,
+    result: status === 'running' ? undefined : script.result,
+  };
+}
+
+/** Emit `running`, wait the way a real call would, emit the result. */
+async function* runDemoTool(
+  script: DemoToolScript,
+  id: string,
+  now: () => number,
+  sleep: (ms: number) => Promise<void>,
+  waitMs: number,
+): AsyncGenerator<StreamEvent> {
+  const startedAt = now();
+  yield { type: 'tool', call: scriptCall(script, id, startedAt, 'running') };
+  await sleep(waitMs);
+  yield { type: 'tool', call: scriptCall(script, id, startedAt, script.status, startedAt + script.ms) };
+}
+
+/** The calls the demo agent makes for each kind of ask. */
+function scriptsFor(target: RouteTarget, intent: Intent): DemoToolScript[] {
+  if (intent === 'code') {
+    return [
+      {
+        name: toolName(target, 'shell'),
+        kind: 'shell',
+        label: 'npm test -- src/lib/sse.test.ts',
+        input: 'npm test -- src/lib/sse.test.ts',
+        status: 'error',
+        ms: 892,
+        result: { stdout: FAILING_TEST, exitCode: 1 },
+      },
+      {
+        name: toolName(target, 'read'),
+        kind: 'read',
+        label: 'src/lib/sse.ts',
+        input: 'src/lib/sse.ts',
+        status: 'done',
+        ms: 96,
+        result: { stdout: SSE_SOURCE },
+      },
+      {
+        name: toolName(target, 'edit'),
+        kind: 'edit',
+        label: 'src/lib/sse.ts',
+        input: 'src/lib/sse.ts',
+        status: 'done',
+        ms: 214,
+        result: { diff: SSE_DIFF },
+      },
+      {
+        name: toolName(target, 'shell'),
+        kind: 'shell',
+        label: 'npm test -- src/lib/sse.test.ts',
+        input: 'npm test -- src/lib/sse.test.ts',
+        status: 'done',
+        ms: 1104,
+        result: { stdout: PASSING_TEST, exitCode: 0 },
+      },
+    ];
+  }
+  if (intent === 'plan') {
+    return [
+      {
+        name: toolName(target, 'read'),
+        kind: 'read',
+        label: 'package.json',
+        input: 'package.json',
+        status: 'done',
+        ms: 74,
+        result: { stdout: PLAN_FILES },
+      },
+      {
+        name: toolName(target, 'search'),
+        kind: 'search',
+        label: 'streamTurn',
+        input: 'streamTurn',
+        status: 'done',
+        ms: 132,
+        result: { stdout: SEARCH_HITS },
+      },
+    ];
+  }
+  if (intent === 'compare') {
+    return [
+      {
+        name: toolName(target, 'search'),
+        kind: 'search',
+        label: 'stream',
+        input: 'stream',
+        status: 'done',
+        ms: 118,
+        result: { stdout: SEARCH_HITS },
+      },
+    ];
+  }
+  return [];
+}
+
+/** The plan the demo agent parks for approval after a design ask. */
+let planCounter = 0;
+
+export function demoPlan(prompt: string, target: RouteTarget): PlanRequest {
+  planCounter += 1;
+  const topic = topicOf(prompt);
+  const structured = profileFor(target).style !== 'prose';
+  const content = [
+    `## ${topic} — 구현 계획`,
+    '',
+    '1. **계약 고정** — 요청/응답 스키마와 에러 상태를 먼저 못 박습니다.',
+    '2. **얇은 경로** — 프롬프트 → 스트림 → 렌더 한 줄기만 연결합니다.',
+    '3. **상태 이전** — 세션과 메모리를 브라우저에서 데몬으로 옮깁니다.',
+    '4. **부가 기능** — 비교 모드와 세션 분기를 그 위에 얹습니다.',
+    '',
+    '변경 예상 파일: `src/lib/desk.ts`, `src/lib/types.ts`, `src/components/Transcript.tsx`',
+    '',
+    structured
+      ? '리스크: 3번을 미루면 비교 모드가 서로 다른 진실을 그리게 됩니다.'
+      : '트레이드오프: UI가 상태를 계속 들고 있으면 두 번째 서피스에서 이어갈 수 없습니다.',
+  ].join('\n');
+  return buildPlan({
+    requestId: `demo-plan-req-${planCounter}`,
+    planId: `plan-demo-${planCounter}`,
+    revision: 1,
+    content,
+    title: `${topic} — 구현 계획`,
+  });
+}
+
 /** Split text into streaming chunks (code points, never mid-surrogate). */
 export function chunkText(text: string): string[] {
   const chars = Array.from(text);
@@ -357,30 +589,127 @@ export class DemoTransport {
     return { chars, limit: 8000 };
   }
 
+  /* ---------------------------------------------------------------- */
+  /* turn.steer — a redirect queued for a running turn                  */
+  /* ---------------------------------------------------------------- */
+
+  private steers = new Map<string, Array<{ text: string; at: number }>>();
+
+  /** Queue a steering instruction for the turn running on `key`. */
+  steer(text: string, key = '*'): void {
+    const body = text.trim();
+    if (!body) return;
+    const queued = this.steers.get(key) ?? [];
+    queued.push({ text: body, at: this.deps.now() });
+    this.steers.set(key, queued);
+  }
+
+  /** Steers waiting for a turn; the stream drains them between chunks. */
+  private takeSteers(key: string): Array<{ text: string; at: number }> {
+    const queued = this.steers.get(key) ?? [];
+    this.steers.delete(key);
+    return queued;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* session.fork                                                       */
+  /* ---------------------------------------------------------------- */
+
+  private forkCount = 0;
+
+  /** Copy a session into a branch; returns the new session id. */
+  forkSession(sessionId?: string, title?: string): string {
+    this.forkCount += 1;
+    const id = `demo-fork-${this.forkCount}`;
+    const source = this.sessions.find((row) => row.sessionId === sessionId);
+    this.addSession({
+      sessionId: id,
+      backend: source?.backend ?? 'claude',
+      title: `${title ?? source?.title ?? '새 대화'} (fork)`,
+      createdAt: this.deps.now(),
+    });
+    return id;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* plan.respond                                                       */
+  /* ---------------------------------------------------------------- */
+
+  private plans: Array<{ planId: string; revision: number; status: string }> = [];
+
+  async respondPlan(input: {
+    planId: string;
+    revision?: number;
+    decision: PlanDecision;
+    feedback?: string;
+  }): Promise<{ status: string; applied: boolean; revision: number }> {
+    await this.deps.sleep(140);
+    const status =
+      input.decision === 'approve' ? 'approved' : input.decision === 'request_changes' ? 'changes_requested' : 'deferred';
+    const revision = input.revision ?? 1;
+    const existing = this.plans.find((row) => row.planId === input.planId);
+    if (existing) existing.status = status;
+    else this.plans.push({ planId: input.planId, revision, status });
+    return { status, applied: input.decision !== 'defer', revision: input.decision === 'request_changes' ? revision + 1 : revision };
+  }
+
   async *streamTurn(
     prompt: string,
     target: RouteTarget,
-    opts: { signal?: AbortSignal; composeFrom?: string } = {},
+    opts: { signal?: AbortSignal; composeFrom?: string; steerKey?: string } = {},
   ): AsyncGenerator<StreamEvent> {
     const profile = profileFor(target);
     const { sleep, random } = this.deps;
     // `prompt` is what the desk actually sent (memory block included);
     // the answer is composed from the user's clean words.
-    const text = composeReply(opts.composeFrom ?? prompt, target);
+    const ask = opts.composeFrom ?? prompt;
+    const intent = detectIntent(ask);
+    const text = composeReply(ask, target);
     const started = this.deps.now();
+    const steerKey = opts.steerKey ?? target.key;
     yield { type: 'start', turnId: `demo-${started.toString(36)}` };
 
     const delay = (min: number, max: number) => min + Math.round(random() * (max - min));
     await sleep(delay(profile.firstToken[0], profile.firstToken[1]));
 
     const chunks = chunkText(text);
-    for (const chunk of chunks) {
+    const scripts = scriptsFor(target, intent);
+    const between = scripts.length > 0 ? Math.max(1, Math.floor(chunks.length / (scripts.length + 1))) : chunks.length;
+    let cursor = 0;
+    let nextTool = 0;
+    let toolSeq = 0;
+
+    const runTool = (script: DemoToolScript): AsyncGenerator<StreamEvent> => {
+      toolSeq += 1;
+      const id = `demo-call-${toolSeq}-${started.toString(36)}`;
+      return runDemoTool(script, id, this.deps.now, sleep, delay(150, 280));
+    };
+
+    while (cursor < chunks.length) {
       if (opts.signal?.aborted) {
         yield { type: 'done', stopReason: 'canceled' };
         return;
       }
-      yield { type: 'delta', text: chunk };
+      const steered = this.takeSteers(steerKey);
+      for (const note of steered) {
+        yield { type: 'steer', text: note.text, at: note.at };
+        yield { type: 'delta', text: `\n\n> ${note.text} — 반영해서 이어갑니다.\n\n` };
+      }
+      yield { type: 'delta', text: chunks[cursor] };
+      cursor += 1;
+      if (scripts.length > 0 && cursor % between === 0 && nextTool < scripts.length) {
+        const script = scripts[nextTool];
+        nextTool += 1;
+        yield* runTool(script);
+      }
       await sleep(delay(profile.pace[0], profile.pace[1]));
+    }
+
+    // A short answer may finish before every scripted call fired.
+    while (nextTool < scripts.length) {
+      const script = scripts[nextTool];
+      nextTool += 1;
+      yield* runTool(script);
     }
 
     const inputTokens = Math.max(12, Math.round(prompt.length / 3.6));
@@ -393,6 +722,14 @@ export class DemoTransport {
         costUsd: (inputTokens / 1000) * profile.price.input + (outputTokens / 1000) * profile.price.output,
       },
     };
+
+    if (intent === 'plan') {
+      // A design ask parks a plan for approval — the card is the demo's
+      // plan.respond surface, same as the daemon's `kind: plan` ask.
+      yield { type: 'plan', plan: demoPlan(ask, target) };
+      yield { type: 'done', stopReason: 'awaiting_plan' };
+      return;
+    }
     yield { type: 'done', stopReason: 'completed' };
   }
 }

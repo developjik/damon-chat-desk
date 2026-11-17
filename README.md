@@ -35,17 +35,23 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 ![사이드바이드 비교 — 같은 프롬프트, 두 라우트](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/compare.png)
 
-## 지금 되는 것 (Step 2 MVP)
+## 지금 되는 것 (Step 2 MVP + 에이전트 제어)
 
 - **전송 계층 3개, UI는 하나.** 같은 이벤트로 수렴한다.
-  - `daemon` — `damon-agent-core` 실제 표면. `GET /health` → `POST /v1/ws_ticket` → `GET /ws`(JSON-RPC v2). `session.list`/`session.create`/`session.messages`, `turn.start` + `session.event` 스트리밍, `memory.list`/`memory.usage`, `permission.respond`.
+  - `daemon` — `damon-agent-core` 실제 표면. `GET /health` → `POST /v1/ws_ticket` → `GET /ws`(JSON-RPC v2). `session.list`/`session.create`/`session.messages`/`session.fork`, `turn.start` + `session.event` 스트리밍, `turn.steer`/`turn.cancel`, `plan.list`/`plan.respond`, `memory.list`/`memory.usage`, `permission.respond`.
   - `openai` — OpenAI 호환 `/v1/models`, `/v1/chat/completions`(SSE). LM Studio·llama.cpp·LiteLLM·게이트웨이.
-  - `demo` — 시뮬레이션된 데몬. 네트워크도 키도 없이 GitHub Pages 방문자가 바로 체험. 4개 프로바이더(Claude Code · Codex CLI · Qwen Code · OpenCode)가 서로 다른 속도·말투·단가로 스트리밍한다.
+  - `demo` — 시뮬레이션된 데몬. 네트워크도 키도 없이 GitHub Pages 방문자가 바로 체험. 4개 프로바이더(Claude Code · Codex CLI · Qwen Code · OpenCode)가 서로 다른 속도·말투·단가로 스트리밍하고, 백엔드별 툴 이름(`Bash`/`shell`/`bash`)으로 현실적인 툴 로그와 계획 승인 카드까지 재현한다.
 - **프로바이더 스위처**: 응답 카드 헤더에 `프로바이더 / 모델`, 푸터에 TTFT·총 시간·토큰·토큰/초·비용·컨텍스트 사용량.
 - **비교 모드**: `split` 칩 → A/B 라우트 선택 → 같은 프롬프트를 동시에. 카드마다 독립 취소·재시도.
 - **세션/메모리 사이드바**: 데몬 세션 목록(`session.list`), 데몬 세션 가져오기(`session.messages`), 메모리 원장(`memory.list`)과 주입 토글 — 주입 시 실제로 프롬프트 앞에 `<memory>` 블록이 붙고, 무엇이 붙는지 사이드바에서 그대로 확인할 수 있다.
+- **툴 결과 뷰어**: `timeline/tool_call`을 `call_id`로 접어 한 호출 = 한 행으로 만든다. 행은 `Bash · npm test --run · 1.28s · done`처럼 접혀 있고, 펼치면 인자·stdout/stderr·unified diff(+/− 거터)·exit code·소요 시간이 보인다. 데몬의 `ToolCallDetail`(shell·read·edit·write·search·fetch·sub_agent)을 그대로 정규화하며, 실행 중인 호출은 펄스로 남는다.
+- **스트리밍 중 `turn.steer`**: 응답이 흐르는 동안 입력창이 `send` → `steer`로 바뀐다. 보낸 문장은 새 턴을 열지 않고 진행 중인 턴으로 들어가며, 카드에 `↳ 방향 수정 …` 행으로 남는다. 데몬이 `-32002`(백엔드 미지원)로 거절하면 그 사실이 행에 표시되고 다음 메시지로 넘긴다.
+- **계획 승인 카드 (`plan.respond`)**: `kind: plan` 승인 요청(Claude의 ExitPlanMode)은 계획 원문을 구조화해 단계·변경 파일·리스크로 보여준다. `approve`/`request changes`/`defer` 세 갈래로 응답하고, 수정 요청은 문장이 deny 메시지로 그대로 전달된다. `plan.list`로 얻은 `planId`+`revision`(CAS)으로 보내므로 다른 서피스가 먼저 결정하면 `-32009` 충돌을 카드에 표시한다. `permission_resolved`가 오면 카드는 더 이상 답할 수 없는 상태로 닫힌다.
+- **턴 단위 분기 (`session.fork`)**: 답변 카드의 `branch` 버튼이 그 턴까지의 대화를 새 세션으로 복사하고, 데스크는 그 복사본을 새 대화로 연다(제목 `… (fork)`, 상단 `branch` 배지). 원본 세션은 그대로 이어간다.
 - **승인 카드**: 데몬이 `permission_requested`를 보내면 카드에 액션 버튼이 뜨고 `permission.respond`로 응답한다.
-- 단위 테스트 76개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·컨트롤러).
+- 단위 테스트 129개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·컨트롤러).
+
+![에이전트 제어 — 툴 결과 뷰어·턴 스티어·계획 승인 카드](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/agent-controls.png)
 
 ## 실행
 
@@ -106,9 +112,10 @@ python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SS
 ```
 
 `mock-daemon.py`는 실제 프로토콜 프레임을 그대로 흉내낸다: `hello`, `session.list`,
-`session.create`, `session.messages`, `catalog.models`, `memory.list`/`memory.usage`,
-그리고 `turn.start` 이후의 `session.event` 델타·`turn_completed`(usage). 데스크를 `/dm`으로
-연결하면 세션 목록·메모리·스트리밍·usage까지 실제 경로로 확인된다.
+`session.create`, `session.messages`, `session.fork`, `catalog.models`, `memory.list`/`memory.usage`,
+`turn.start` 이후의 `session.event` 델타·툴 호출(셸 출력·diff)·`turn_completed`(usage),
+`turn.steer`, 그리고 `kind: plan` 승인 요청 → `plan.list` → `plan.respond`(승인 전까지 턴이 멈춰 있는다)
+까지다. 데스크를 `/dm`으로 연결하면 툴 아코디언·스티어·계획 카드·분기를 실제 경로로 확인된다.
 
 ## 메모리 주입에 대해
 
@@ -126,7 +133,10 @@ python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SS
 | `POST /v1/ws_ticket` | 마스터 `Authorization: Bearer` 또는 `{deviceToken}` → 1회용 티켓(60s) |
 | `GET /ws?ticket=…` | JSON-RPC v2. `hello` → `session.*` / `turn.*` / `memory.*` / `catalog.models` |
 | `POST /v1/pair`, `/v1/pair/status` | 기기 페어링(pending → approved → revoked) |
-| `session.event` 푸시 | `turn_started`, `timeline`(assistant_message·tool_call), `turn_completed`(usage), `turn_failed`, `permission_requested` |
+| `session.event` 푸시 | `turn_started`, `timeline`(assistant_message·tool_call[detail]), `turn_completed`(usage), `turn_failed`, `permission_requested`(tool·question·**plan**), `permission_resolved` |
+| `turn.steer` / `turn.cancel` | 진행 중인 턴에 방향 수정을 주입 / 취소 |
+| `session.fork` | 세션 복사(메시지·태그·usage·resume handle) → 새 `sessionId` |
+| `plan.list` / `plan.respond` | 계획 리뷰 리비전 목록 / `expectedRevision` CAS 승인·수정요청·보류 (`-32009` 충돌) |
 
 주의: 업스트림에서 OpenAI 호환 `/v1/chat/completions`·`/v1/models`는 **제거**되었다(에이전트가 답하는 구조로 전환).
 그래서 데스크는 `/health`의 응답 모양으로 표면을 판별하고(`backends[]` → daemon, 아니면 `/v1/models` → openai),

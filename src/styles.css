@@ -1263,6 +1263,18 @@ a {
   background: #8f9cfa;
 }
 
+/* While a reply streams the same button steers it instead of sending. */
+.send-btn.steer {
+  background: var(--surface-3);
+  border: 1px solid rgba(124, 140, 248, 0.42);
+  color: #a9b4ff;
+  font-weight: 500;
+}
+
+.send-btn.steer:hover:not(:disabled) {
+  background: var(--accent-dim);
+}
+
 .composer-foot {
   max-width: var(--col);
   margin: 6px auto 0;
@@ -1307,6 +1319,595 @@ a {
 .chip-count {
   font-size: 9.5px;
   opacity: 0.75;
+}
+
+/* ---------------------------------------------------------------- agent controls */
+
+/* steer rail — instructions sent into the running turn */
+
+.steers {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-bottom: 1px solid var(--line-soft);
+  background: #0c0c0e;
+}
+
+.steer {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 5px 11px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+.steer + .steer {
+  border-top: 1px solid var(--line-soft);
+}
+
+.steer-mark {
+  color: #a9b4ff;
+  font-size: 11px;
+  flex: none;
+}
+
+.steer-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.steer-state {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.steer.failed {
+  color: #f0a5a5;
+}
+
+.steer.failed .steer-mark,
+.steer.failed .steer-state {
+  color: var(--err);
+}
+
+/* tool rail — one row per call, each opening to input + result */
+
+.tools {
+  border-bottom: 1px solid var(--line-soft);
+  background: #0c0c0e;
+}
+
+.tools-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 27px;
+  padding: 0 11px;
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: left;
+}
+
+.tools-head:hover {
+  color: var(--text-dim);
+}
+
+.tools-chevron {
+  font-size: 8px;
+  width: 8px;
+}
+
+.tools-title {
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.tools-count {
+  color: var(--text);
+  font-size: 9.5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.tools-summary {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tools-list {
+  border-top: 1px solid var(--line-soft);
+}
+
+.tool {
+  border-top: 1px solid var(--line-soft);
+}
+
+.tool:first-child {
+  border-top: none;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 11px;
+  cursor: pointer;
+  list-style: none;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.tool-head::-webkit-details-marker {
+  display: none;
+}
+
+.tool-head:hover {
+  background: #101013;
+}
+
+.tool-chevron {
+  font-size: 8px;
+  color: var(--text-faint);
+  flex: none;
+  transition: transform 0.12s ease;
+}
+
+.tool[open] .tool-chevron {
+  transform: rotate(90deg);
+}
+
+.tool-glyph {
+  width: 12px;
+  flex: none;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.tool-glyph.shell {
+  color: #8fb4ff;
+}
+
+.tool-glyph.edit,
+.tool-glyph.write {
+  color: var(--warn);
+}
+
+.tool-glyph.search,
+.tool-glyph.fetch {
+  color: #7fd1b0;
+}
+
+.tool-name {
+  flex: none;
+  color: var(--text);
+  font-size: 10.5px;
+}
+
+.tool-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.tool-head-right {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.tool-dur {
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+
+.tool-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tool-status.done {
+  color: var(--ok);
+}
+
+.tool-status.error {
+  color: var(--err);
+}
+
+.tool-status.running {
+  color: #a9b4ff;
+}
+
+.tool-body {
+  padding: 2px 11px 9px 29px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-section {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tool-section-label {
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.tool-pre {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: #08080a;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 190px;
+  overflow: auto;
+}
+
+.tool-pre.err {
+  color: #f0a5a5;
+  border-color: rgba(239, 107, 107, 0.28);
+}
+
+.tool-diff {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: #08080a;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre;
+  overflow: auto;
+  max-height: 220px;
+}
+
+.diff-line {
+  display: block;
+}
+
+.diff-line.add {
+  color: #86d9a2;
+  background: rgba(74, 194, 107, 0.08);
+}
+
+.diff-line.del {
+  color: #f0a5a5;
+  background: rgba(239, 107, 107, 0.08);
+}
+
+.diff-line.meta {
+  color: var(--text-faint);
+}
+
+.tool-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 9px;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+.tool-meta .ok {
+  color: var(--ok);
+}
+
+.tool-meta .err {
+  color: var(--err);
+}
+
+/* plan review card */
+
+.plan {
+  border-bottom: 1px solid var(--line-soft);
+  background: #0b0b0d;
+  padding: 10px 12px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.plan-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.plan-kind {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--warn);
+  flex: none;
+}
+
+.plan-title {
+  font-size: 12.5px;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-rev {
+  flex: none;
+  font-size: 9px;
+  color: var(--text-faint);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.plan-status {
+  margin-left: auto;
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.plan-status.approved {
+  color: var(--ok);
+}
+
+.plan-status.changes_requested {
+  color: #a9b4ff;
+}
+
+.plan-status.deferred,
+.plan-status.expired {
+  color: var(--text-faint);
+}
+
+.plan-status.error {
+  color: var(--err);
+}
+
+.plan-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plan-step {
+  display: flex;
+  gap: 9px;
+  min-width: 0;
+}
+
+.plan-step-no {
+  flex: none;
+  font-size: 9.5px;
+  color: var(--text-faint);
+  padding-top: 1px;
+}
+
+.plan-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.plan-step-title {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.plan-step-detail {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.plan-content {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.plan-files {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.plan-files-label {
+  flex: none;
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.plan-file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.plan-file {
+  font-size: 9.5px;
+  color: var(--text-dim);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+}
+
+.plan-risks {
+  margin: 9px 0 0;
+  padding: 0 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.plan-risks li {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+.plan-risks li::marker {
+  color: var(--warn);
+}
+
+.plan-raw {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.plan-raw summary {
+  cursor: pointer;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.plan-raw-body {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: #08080a;
+  font-size: 10px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.plan-actions .ghost-btn {
+  height: 24px;
+  padding: 0 9px;
+}
+
+.ghost-btn.on {
+  color: #a9b4ff;
+  border-color: rgba(124, 140, 248, 0.35);
+}
+
+.plan-hint {
+  margin-left: auto;
+  font-size: 8.5px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-revise {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plan-revise textarea {
+  width: 100%;
+  min-height: 46px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #08080a;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  resize: vertical;
+}
+
+.plan-revise textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.plan-revise .ghost-btn {
+  align-self: flex-end;
+  height: 24px;
+}
+
+.plan-decision {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.plan-feedback-text {
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.plan-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--err);
 }
 
 /* ---------------------------------------------------------------- route picker */
@@ -1531,7 +2132,7 @@ a {
 
 .feature-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
   border-top: 1px solid var(--line-soft);
   padding-top: 16px;
@@ -1901,6 +2502,27 @@ a {
 
   .route-menu {
     width: min(84vw, 288px);
+  }
+
+  .tools-summary {
+    display: none;
+  }
+
+  .tool-label {
+    max-width: 46vw;
+  }
+
+  .tool-body {
+    padding-left: 24px;
+  }
+
+  .plan-hint {
+    display: none;
+  }
+
+  /* Touch has no hover: the per-card actions stay visible. */
+  .slot-actions {
+    opacity: 1;
   }
 }
 
