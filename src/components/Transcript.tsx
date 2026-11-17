@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ChatMessage, ReplySlot } from '../lib/types';
+import type { ChatMessage, PlanDecision, ReplySlot } from '../lib/types';
 import { Markdown } from './Markdown';
+import { PlanCard } from './PlanCard';
+import { ToolViewer } from './ToolViewer';
 import { SlotMetrics } from './RoutePicker';
 
 interface TranscriptProps {
@@ -8,6 +10,8 @@ interface TranscriptProps {
   onRetry: (message: ChatMessage, slot: ReplySlot) => void;
   onCancel: (slot: ReplySlot) => void;
   onRespond: (slot: ReplySlot, actionId: string) => void;
+  onFork: (message: ChatMessage, slot: ReplySlot) => void;
+  onPlan: (message: ChatMessage, slot: ReplySlot, decision: PlanDecision, feedback?: string) => void;
   emptyState: React.ReactNode;
 }
 
@@ -32,12 +36,16 @@ function SlotCard({
   onRetry,
   onCancel,
   onRespond,
+  onFork,
+  onPlan,
 }: {
   slot: ReplySlot;
   now: number;
   onRetry: () => void;
   onCancel: () => void;
   onRespond: (actionId: string) => void;
+  onFork: () => void;
+  onPlan: (decision: PlanDecision, feedback?: string) => void;
 }) {
   const streaming = slot.status === 'streaming' || slot.status === 'queued';
   return (
@@ -55,6 +63,26 @@ function SlotCard({
       </header>
 
       {slot.notice ? <div className="slot-notice mono">{slot.notice}</div> : null}
+
+      {slot.steers && slot.steers.length > 0 ? (
+        <div className="steers">
+          {slot.steers.map((note) => (
+            <div className={`steer ${note.state}`} key={note.id}>
+              <span className="steer-mark mono" aria-hidden>
+                ↳
+              </span>
+              <span className="steer-text">{note.text}</span>
+              <span className="steer-state mono" title={note.error ?? note.ack ?? 'turn.steer'}>
+                {note.state === 'failed' ? `not delivered · ${note.error ?? 'error'}` : 'steer sent'}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {slot.tools && slot.tools.length > 0 ? <ToolViewer calls={slot.tools} now={now} /> : null}
+
+      {slot.plan ? <PlanCard plan={slot.plan} onDecide={onPlan} /> : null}
 
       {slot.ask ? (
         <div className="ask">
@@ -100,9 +128,14 @@ function SlotCard({
               stop
             </button>
           ) : (
-            <button type="button" className="ghost-btn" onClick={onRetry}>
-              retry
-            </button>
+            <>
+              <button type="button" className="ghost-btn" onClick={onFork} title="이 턴에서 새 분기 세션을 만듭니다 (session.fork)">
+                branch
+              </button>
+              <button type="button" className="ghost-btn" onClick={onRetry}>
+                retry
+              </button>
+            </>
           )}
         </div>
       </footer>
@@ -115,7 +148,7 @@ function sliceError(error?: string): string {
   return error.length > 400 ? `${error.slice(0, 400)}…` : error;
 }
 
-export function Transcript({ messages, onRetry, onCancel, onRespond, emptyState }: TranscriptProps) {
+export function Transcript({ messages, onRetry, onCancel, onRespond, onFork, onPlan, emptyState }: TranscriptProps) {
   const scroller = useRef<HTMLDivElement | null>(null);
   const stick = useRef(true);
   const [now, setNow] = useState(() => Date.now());
@@ -177,6 +210,8 @@ export function Transcript({ messages, onRetry, onCancel, onRespond, emptyState 
                   onRetry={() => onRetry(message, slot)}
                   onCancel={() => onCancel(slot)}
                   onRespond={(actionId) => onRespond(slot, actionId)}
+                  onFork={() => onFork(message, slot)}
+                  onPlan={(decision, feedback) => onPlan(message, slot, decision, feedback)}
                 />
               ))}
             </div>

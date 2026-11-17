@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { DeskController, DeskState } from './lib/desk';
-import type { ReplySlot, TransportKind } from './lib/types';
+import type { PlanDecision, ReplySlot, TransportKind } from './lib/types';
 import { Composer } from './components/Composer';
 import { ConnectPanel } from './components/ConnectPanel';
 import { Sidebar } from './components/Sidebar';
@@ -15,7 +15,6 @@ const SUGGESTIONS: Array<{ label: string; prompt: string }> = [
   { label: 'compare routes', prompt: '스트리밍 응답과 배치 응답, 채팅 UI엔 어느 쪽이 맞아? 비교해 줘.' },
   { label: 'design order', prompt: '데몬이 상태를 들고 있는 채팅 클라이언트의 구현 순서를 잡아줘.' },
 ];
-
 function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state: DeskState }) {
   return (
     <div className="empty">
@@ -47,8 +46,12 @@ function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state
           <p>같은 프롬프트를 두 프로바이더에 fan-out, 나란히 스트리밍.</p>
         </div>
         <div className="feature">
-          <span className="feature-key mono">03 / memory</span>
-          <p>데몬 메모리 원장과 세션. 두 번째 서피스에서 같은 대화를 이어갑니다.</p>
+          <span className="feature-key mono">03 / tools</span>
+          <p>툴 호출은 한 줄로 접히고, 펼치면 인자·stdout·diff·소요 시간이 그대로 보입니다.</p>
+        </div>
+        <div className="feature">
+          <span className="feature-key mono">04 / steer · plan</span>
+          <p>스트리밍 중 방향 수정(turn.steer), 에이전트 계획서 승인/수정 요청(plan.respond), 턴 단위 분기(session.fork).</p>
         </div>
       </div>
     </div>
@@ -78,6 +81,15 @@ export function App({ desk }: AppProps) {
     const action = ask.actions.find((entry) => entry.id === actionId) ?? ask.actions[0];
     if (!action) return;
     void desk.respond(ask, action, slot.daemonSessionId);
+  };
+
+  const fork = (messageId: string) => {
+    if (conversation) void desk.forkAt(conversation.id, messageId);
+  };
+
+  const plan = (messageId: string, slot: ReplySlot, decision: PlanDecision, feedback?: string) => {
+    if (!conversation) return;
+    void desk.respondPlan({ convId: conversation.id, messageId, slotId: slot.id }, decision, feedback);
   };
 
   return (
@@ -112,6 +124,7 @@ export function App({ desk }: AppProps) {
             </div>
           </div>
           <div className="topbar-right">
+            {conversation?.forkedFrom ? <span className="badge mono">branch</span> : null}
             {state.compare ? <span className="badge mono">split</span> : null}
             <button type="button" className="icon-btn" onClick={() => setConnectOpen(true)} aria-label="연결 설정" title="연결 설정">
               ⚙
@@ -126,6 +139,8 @@ export function App({ desk }: AppProps) {
           }}
           onCancel={(slot) => desk.cancel(slot.id)}
           onRespond={(slot, actionId) => respond(slot, actionId)}
+          onFork={(message) => fork(message.id)}
+          onPlan={(message, slot, decision, feedback) => plan(message.id, slot, decision, feedback)}
           emptyState={<EmptyState state={state} onPick={(prompt) => void desk.send(prompt)} />}
         />
 
@@ -138,6 +153,7 @@ export function App({ desk }: AppProps) {
           memoryEnabled={state.memory.enabled}
           memoryCount={state.memory.entries.filter((entry) => entry.status === 'active').length}
           onSend={(prompt) => void desk.send(prompt)}
+          onSteer={(text) => void desk.steer(text)}
           onPrimary={(key: string) => desk.setPrimary(key)}
           onSecondary={(key: string) => desk.setSecondary(key)}
           onCompare={(compare: boolean) => desk.setCompare(compare)}

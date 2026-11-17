@@ -11,6 +11,8 @@ interface ComposerProps {
   memoryEnabled: boolean;
   memoryCount: number;
   onSend: (prompt: string) => void;
+  /** While a reply streams, the composer sends `turn.steer` instead. */
+  onSteer: (text: string) => void;
   onPrimary: (key: string) => void;
   onSecondary: (key: string) => void;
   onCompare: (compare: boolean) => void;
@@ -27,6 +29,7 @@ export function Composer({
   memoryEnabled,
   memoryCount,
   onSend,
+  onSteer,
   onPrimary,
   onSecondary,
   onCompare,
@@ -45,12 +48,18 @@ export function Composer({
 
   const submit = () => {
     const prompt = value.trim();
-    if (!prompt || busy) return;
+    if (!prompt) return;
+    if (busy) {
+      onSteer(prompt);
+      setValue('');
+      return;
+    }
+    if (targets.length === 0) return;
     onSend(prompt);
     setValue('');
   };
 
-  const canSend = value.trim().length > 0 && !busy && targets.length > 0;
+  const canSend = value.trim().length > 0 && targets.length > 0;
 
   return (
     <div className="composer">
@@ -59,7 +68,11 @@ export function Composer({
           ref={area}
           value={value}
           rows={1}
-          placeholder={placeholder ?? '메시지를 입력하세요 — Enter로 전송, Shift+Enter로 줄바꿈'}
+          placeholder={
+            busy
+              ? '스트리밍 중 — 방향 수정을 보내면 turn.steer로 전달됩니다 (Enter)'
+              : (placeholder ?? '메시지를 입력하세요 — Enter로 전송, Shift+Enter로 줄바꿈')
+          }
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -104,15 +117,21 @@ export function Composer({
             </button>
           </div>
           <div className="composer-send">
-            <span className="hint mono">{busy ? 'streaming' : '⏎'}</span>
-            <button type="button" className="send-btn" onClick={submit} disabled={!canSend}>
-              {busy ? 'running' : 'send'}
+            <span className="hint mono">{busy ? 'steer' : '⏎'}</span>
+            <button type="button" className={`send-btn ${busy ? 'steer' : ''}`} onClick={submit} disabled={!canSend}>
+              {busy ? 'steer' : 'send'}
             </button>
           </div>
         </div>
       </div>
       <div className="composer-foot mono">
-        <span>{compare ? 'split mode — both routes receive the same prompt' : 'single route'}</span>
+        <span>
+          {busy
+            ? 'steering the live turn — this text does not open a new turn'
+            : compare
+              ? 'split mode — both routes receive the same prompt'
+              : 'single route'}
+        </span>
         <span className="faint">session &amp; memory live on the daemon · UI is a renderer</span>
       </div>
     </div>

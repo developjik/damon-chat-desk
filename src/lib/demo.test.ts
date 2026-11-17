@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEMO_ROUTES, DemoTransport, chunkText, composeReply, detectIntent } from './demo';
-import type { StreamEvent } from './types';
+import { mergeToolCall } from './tools';
+import type { StreamEvent, ToolCall } from './types';
 
 const instant = new DemoTransport({ sleep: async () => undefined, now: () => 1000, random: () => 0.5 });
 
@@ -8,6 +9,18 @@ async function collect(events: AsyncGenerator<StreamEvent>): Promise<StreamEvent
   const out: StreamEvent[] = [];
   for await (const event of events) out.push(event);
   return out;
+}
+
+/** Fold the `tool` snapshots the way the desk does — by call id. */
+function foldTools(events: StreamEvent[]): ToolCall[] {
+  const rows: ToolCall[] = [];
+  for (const event of events) {
+    if (event.type !== 'tool') continue;
+    const at = rows.findIndex((row) => row.id === event.call.id);
+    if (at >= 0) rows[at] = mergeToolCall(rows[at], event.call);
+    else rows.push(event.call);
+  }
+  return rows;
 }
 
 describe('detectIntent', () => {
@@ -48,7 +61,7 @@ describe('chunkText', () => {
 
 describe('DemoTransport.streamTurn', () => {
   it('streams the composed answer and closes with usage', async () => {
-    const prompt = '데몬 클라이언트 구현 순서를 잡아줘';
+    const prompt = 'SSE 응답에서 청크가 프레임 중간에서 끊기면 어떻게 처리해야 해?';
     const target = DEMO_ROUTES[1];
     const events = await collect(instant.streamTurn(prompt, target));
 
@@ -61,6 +74,78 @@ describe('DemoTransport.streamTurn', () => {
     expect(events.at(-1)).toEqual({ type: 'done', stopReason: 'completed' });
     const usage = events.find((event) => event.type === 'usage');
     expect(usage).toMatchObject({ type: 'usage', usage: { inputTokens: expect.any(Number) } });
+  });
+
+  it('simulates a real tool log for a code ask', async () => {
+    const events = await collect(
+      instant.streamTurn('SSE 파서에서 청크 경계 버그 어떻게 잡아?', DEMO_ROUTES[0]),
+    );
+    // Two frames per call — `running`, then the terminal snapshot.
+    expect(events.filter((event) => event.type === 'tool')).toHaveLength(8);
+    const calls = foldTools(events);
+    expect(calls).toHaveLength(4);
+    expect(calls[0]).toMatchObject({ name: 'Bash', kind: 'shell', status: 'error', result: { exitCode: 1 } });
+    expect(calls[0].result?.stdout).toContain('1 failed');
+    expect(calls[1]).toMatchObject({ kind: 'read', label: 'src/lib/sse.ts' });
+    expect(calls[2]).toMatchObject({ kind: 'edit' });
+    expect(calls[3]).toMatchObject({ status: 'done', result: { exitCode: 0 } });
+    expect(calls[2].result?.diff).toContain('+const SEPARATORS');
+    expect(calls[2].endedAt).toBeGreaterThan(calls[2].startedAt);
+  });
+
+  it('names the tool vocabulary per provider', async () => {
+    const claude = await collect(instant.streamTurn('파서 버그 잡아줘', DEMO_ROUTES[0]));
+    const codex = await collect(instant.streamTurn('파서 버그 잡아줘', DEMO_ROUTES[1]));
+    const namesOf = (events: StreamEvent[]) =>
+      events.flatMap((event) => (event.type === 'tool' ? [event.call.name] : []));
+    expect(namesOf(claude)).toContain('Bash');
+    expect(namesOf(codex)).toContain('shell');
+  });
+
+  it('parks a plan for review after a design ask', async () => {
+    const events = await collect(instant.streamTurn('구현 순서를 잡아줘', DEMO_ROUTES[0]));
+    const planEvent = events.find((event): event is Extract<StreamEvent, { type: 'plan' }> => event.type === 'plan');
+    expect(planEvent).toBeTruthy();
+    expect(planEvent?.plan.steps.length).toBeGreaterThan(2);
+    expect(planEvent?.plan.status).toBe('awaiting_review');
+    expect(events.at(-1)).toEqual({ type: 'done', stopReason: 'awaiting_plan' });
+  });
+
+  it('injects a queued steer and acknowledges it in the stream', async () => {
+    const demo = new DemoTransport({ sleep: () => new Promise((resolve) => setTimeout(resolve, 1)), now: () => 1000 });
+    const target = DEMO_ROUTES[2];
+    const events: StreamEvent[] = [];
+    let steered = false;
+    for await (const event of demo.streamTurn('테스트', target, { steerKey: target.key })) {
+      events.push(event);
+      if (!steered && event.type === 'delta') {
+        demo.steer('대신 스트리밍 쪽으로 가자', target.key);
+        steered = true;
+      }
+    }
+    const steer = events.find((event) => event.type === 'steer');
+    expect(steer).toMatchObject({ type: 'steer', text: '대신 스트리밍 쪽으로 가자' });
+    const text = events
+      .filter((event): event is Extract<StreamEvent, { type: 'delta' }> => event.type === 'delta')
+      .map((event) => event.text)
+      .join('');
+    expect(text).toContain('대신 스트리밍 쪽으로 가자');
+  });
+
+  it('forks a session into a titled branch', () => {
+    const demo = new DemoTransport({ now: () => 1000 });
+    demo.seedSessions([{ sessionId: 'seed-1', backend: 'claude', title: '원본', createdAt: 1 }]);
+    const id = demo.forkSession('seed-1', '원본');
+    expect(id).toBe('demo-fork-1');
+    expect(demo.sessionsList().find((row) => row.sessionId === id)?.title).toBe('원본 (fork)');
+  });
+
+  it('records a plan decision', async () => {
+    const demo = new DemoTransport({ sleep: async () => undefined });
+    const approved = await demo.respondPlan({ planId: 'p1', decision: 'approve' });
+    expect(approved).toMatchObject({ status: 'approved', applied: true });
+    const revised = await demo.respondPlan({ planId: 'p1', revision: 1, decision: 'request_changes' });
+    expect(revised).toMatchObject({ status: 'changes_requested', revision: 2 });
   });
 
   it('stops when the signal aborts', async () => {
