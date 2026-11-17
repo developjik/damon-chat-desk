@@ -11,6 +11,10 @@
  *   POST /v1/pair/status   {deviceId, token} → {status}
  *   GET  /ws?ticket=…      JSON-RPC: session.*, turn.*, memory.*, catalog.*
  *
+ * Memory: list/write/remove/approve/reject per ledger (`user`, or a bot
+ * named by `owner`), usage counts ACTIVE chars only. Sessions: list,
+ * rename, set_archived, delete, export.
+ *
  * Note the daemon no longer serves OpenAI-compatible `/v1/models` or
  * `/v1/chat/completions` (removed upstream; agents answer, not a proxy).
  * The desk detects which surface is there and speaks the right one —
@@ -18,7 +22,18 @@
  */
 
 import { RpcClient, RpcError, rpcErrorHint, type HelloPayload, type ServerEvent, type SocketFactory, wsUrlFor } from './rpc';
-import type { ChatMessage, DaemonHealth, MemoryEntry, PermissionAsk, PlanDecision, ReplySlot, RouteTarget, StreamEvent, Usage } from './types';
+import type {
+  ChatMessage,
+  DaemonHealth,
+  MemoryEntry,
+  MemoryScope,
+  PermissionAsk,
+  PlanDecision,
+  ReplySlot,
+  RouteTarget,
+  StreamEvent,
+  Usage,
+} from './types';
 import { makeTarget, targetKey } from './targets';
 import { buildPlan } from './plan';
 import { normalizeToolCall } from './tools';
@@ -86,6 +101,13 @@ export interface DaemonSessionRow {
   tags?: string[];
   pinned?: boolean;
   archived?: boolean;
+}
+
+/** `session.export` — the daemon's own serialization of one session. */
+export interface DaemonSessionExport {
+  session?: { sessionId: string; createdAt?: number; backend?: string; title?: string | null; tags?: string[]; cwd?: string | null };
+  messages?: Array<{ id: number | string; role: string; ts?: number; data?: { content?: string; items?: string[] } | null }>;
+  usage?: { contextUsed?: number; contextSize?: number; costUsd?: number; turns?: number };
 }
 
 interface StoredMessage {
@@ -412,12 +434,38 @@ export class DaemonTransport {
     return routes.sort((a, b) => a.providerLabel.localeCompare(b.providerLabel) || a.modelLabel.localeCompare(b.modelLabel));
   }
 
-  async listSessions(limit = 60): Promise<DaemonSessionRow[]> {
-    const result = await this.client.request<{ sessions?: DaemonSessionRow[] }>('session.list', {
-      limit,
-      includeArchived: false,
-    });
+  async listSessions(limit = 60, opts: { includeArchived?: boolean; backend?: string } = {}): Promise<DaemonSessionRow[]> {
+    const params: Record<string, unknown> = { limit, includeArchived: opts.includeArchived === true };
+    if (opts.backend) params.backend = opts.backend;
+    const result = await this.client.request<{ sessions?: DaemonSessionRow[] }>('session.list', params);
     return Array.isArray(result.sessions) ? result.sessions : [];
+  }
+
+  /** `session.rename {sessionId, title}` → `{renamed}`. */
+  async renameSession(sessionId: string, title: string): Promise<boolean> {
+    const result = await this.client.request<{ renamed?: boolean }>('session.rename', { sessionId, title }, 10_000);
+    return result?.renamed === true;
+  }
+
+  /** Hide a row from `session.list` without deleting its history. */
+  async setSessionArchived(sessionId: string, archived: boolean): Promise<boolean> {
+    const result = await this.client.request<{ updated?: boolean }>(
+      'session.set_archived',
+      { sessionId, archived },
+      10_000,
+    );
+    return result?.updated === true;
+  }
+
+  /** Delete the session row (and tombstone a discovered native handle). */
+  async deleteSession(sessionId: string): Promise<boolean> {
+    const result = await this.client.request<{ deleted?: boolean }>('session.delete', { sessionId }, 15_000);
+    return result?.deleted === true;
+  }
+
+  /** The daemon's own session serialization (session + messages + usage). */
+  async exportSession(sessionId: string): Promise<DaemonSessionExport> {
+    return this.client.request<DaemonSessionExport>('session.export', { sessionId }, 20_000);
   }
 
   async createSession(input: { backend: string; model?: string; cwd?: string }): Promise<string> {
@@ -440,17 +488,61 @@ export class DaemonTransport {
     return this.client.request('session.usage', { sessionId });
   }
 
-  async memory(includePending = false): Promise<MemoryEntry[]> {
-    const result = await this.client.request<{ entries?: MemoryEntry[] }>('memory.list', {
-      scope: 'user',
-      includePending,
-    });
+  /** One ledger: `memory.list {scope, owner?, includePending?}`. */
+  async listMemory(input: { scope?: MemoryScope; owner?: string | null; includePending?: boolean } = {}): Promise<MemoryEntry[]> {
+    const scope = input.scope ?? 'user';
+    const params: Record<string, unknown> = { scope, includePending: input.includePending === true };
+    if (scope === 'bot' && input.owner) params.owner = input.owner;
+    const result = await this.client.request<{ entries?: MemoryEntry[] }>('memory.list', params, 10_000);
     return Array.isArray(result.entries) ? result.entries : [];
   }
 
-  async memoryUsage(): Promise<{ chars: number; limit: number }> {
-    const result = await this.client.request<{ chars?: number; limit?: number }>('memory.usage', { scope: 'user' });
-    return { chars: result.chars ?? 0, limit: result.limit ?? 0 };
+  /** `memory.usage` — chars counts ACTIVE entries only. */
+  async memoryUsage(scope: MemoryScope = 'user', owner?: string | null): Promise<{ chars: number; limit: number }> {
+    const params: Record<string, unknown> = { scope };
+    if (scope === 'bot' && owner) params.owner = owner;
+    const result = await this.client.request<{ chars?: number; limit?: number }>('memory.usage', params, 10_000);
+    return { chars: result?.chars ?? 0, limit: result?.limit ?? 0 };
+  }
+
+  /**
+   * `memory.write` — one gate chain (scan → cap → approval). A refusal is
+   * `-32011` with `error.data.kind`; nothing is ever sanitized or
+   * truncated, so the caller shows the kind instead of retrying silently.
+   */
+  async writeMemory(input: {
+    scope: MemoryScope;
+    owner?: string | null;
+    content: string;
+    source?: string;
+  }): Promise<{ id: string; status: 'active' | 'pending' }> {
+    const params: Record<string, unknown> = { scope: input.scope, content: input.content };
+    if (input.scope === 'bot' && input.owner) params.owner = input.owner;
+    if (input.source) params.source = input.source;
+    const result = await this.client.request<{ id?: string; status?: 'active' | 'pending' }>('memory.write', params, 15_000);
+    if (!result?.id) throw new Error('memory.write returned no id');
+    return { id: result.id, status: result.status === 'pending' ? 'pending' : 'active' };
+  }
+
+  async removeMemory(id: string): Promise<boolean> {
+    const result = await this.client.request<{ removed?: boolean }>('memory.remove', { id }, 10_000);
+    return result?.removed === true;
+  }
+
+  /** One-shot CAS on a pending write: false when unknown or already active. */
+  async approveMemory(id: string): Promise<boolean> {
+    const result = await this.client.request<{ approved?: boolean }>('memory.approve', { id }, 10_000);
+    return result?.approved === true;
+  }
+
+  async rejectMemory(id: string): Promise<boolean> {
+    const result = await this.client.request<{ rejected?: boolean }>('memory.reject', { id }, 10_000);
+    return result?.rejected === true;
+  }
+
+  /** The user ledger's entries — the injection source. */
+  async memory(includePending = false): Promise<MemoryEntry[]> {
+    return this.listMemory({ scope: 'user', includePending });
   }
 
   async cancelTurn(sessionId: string): Promise<void> {
