@@ -111,6 +111,8 @@ function SlotCard({
           <Markdown source={slot.text} streaming={slot.status === 'streaming'} />
         ) : slot.status === 'error' ? (
           <p className="slot-error">{sliceError(slot.error)}</p>
+        ) : slot.status === 'canceled' ? (
+          <p className="slot-canceled">중단됨 — 응답이 시작되기 전에 멈췄습니다</p>
         ) : (
           <div className="skeleton" aria-label="waiting for the first token">
             <span />

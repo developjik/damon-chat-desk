@@ -559,3 +559,149 @@ describe('DeskController — export', () => {
     expect(desk.getSnapshot().notice).toContain('메시지가 없어');
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* stop — turn.cancel from the button, the palette and Esc             */
+/* ------------------------------------------------------------------ */
+
+function lastSlots(desk: DeskController) {
+  const state = desk.getSnapshot();
+  const conversation = state.conversations.find((entry) => entry.id === state.activeId);
+  const message = [...(conversation?.messages ?? [])].reverse().find((entry) => entry.slots && entry.slots.length > 0);
+  return message?.slots ?? [];
+}
+
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > 3000) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+function slowDesk(ms = 3) {
+  const demo = new DemoTransport({ sleep: () => new Promise<void>((resolve) => setTimeout(resolve, ms)) });
+  return new DeskController({ demo });
+}
+
+describe('DeskController — stop', () => {
+  it('keeps the partial text and marks the slot canceled, not error', async () => {
+    const desk = slowDesk();
+    await desk.init();
+    const sending = desk.send('SSE 응답에서 청크가 프레임 중간에서 끊기면 어떻게 처리해야 해?');
+    await waitUntil(() => (lastSlots(desk)[0]?.text.length ?? 0) > 0, 'the first token');
+
+    const partial = lastSlots(desk)[0].text;
+    expect(desk.getSnapshot().busy).toBe(true);
+    expect(desk.stop()).toBe(1);
+    await sending;
+
+    const slot = lastSlots(desk)[0];
+    expect(slot.status).toBe('canceled');
+    expect(slot.text).toBe(partial);
+    expect(slot.error).toBeUndefined();
+    expect(slot.endedAt).toBeTypeOf('number');
+    expect(desk.getSnapshot().busy).toBe(false);
+    expect(desk.getSnapshot().notice).toContain('중단');
+  });
+
+  it('stops before the first token without leaving a skeleton state', async () => {
+    const desk = slowDesk();
+    await desk.init();
+    const sending = desk.send('구현 순서를 잡아줘');
+    expect(desk.stop()).toBe(1);
+    await sending;
+    const slot = lastSlots(desk)[0];
+    expect(slot.status).toBe('canceled');
+    expect(slot.text).toBe('');
+  });
+
+  it('stops one side of a split turn and lets the other finish', async () => {
+    const desk = slowDesk(2);
+    await desk.init();
+    desk.setCompare(true);
+    const sending = desk.send('스트리밍 응답과 배치 응답, 채팅 UI엔 어느 쪽이 맞아? 비교해 줘.');
+    await waitUntil(() => lastSlots(desk).length === 2 && lastSlots(desk).every((slot) => slot.text.length > 0), 'both streams');
+
+    const [first, second] = lastSlots(desk);
+    expect(desk.stop(first.id)).toBe(1);
+    await sending;
+
+    const after = lastSlots(desk);
+    expect(after.find((slot) => slot.id === first.id)?.status).toBe('canceled');
+    expect(after.find((slot) => slot.id === second.id)?.status).toBe('done');
+    expect(desk.getSnapshot().busy).toBe(false);
+  });
+
+  it('is a no-op when nothing is streaming', async () => {
+    const { desk } = await ready();
+    expect(desk.stop()).toBe(0);
+    expect(desk.stop('missing-slot')).toBe(0);
+    expect(desk.getSnapshot().notice).toBeUndefined();
+  });
+
+  it('drops tokens that arrive after the stop instead of growing the answer', async () => {
+    const demo = new DemoTransport({ sleep: async () => undefined });
+    let parked = false;
+    let resume: () => void = () => undefined;
+    demo.streamTurn = async function* (): AsyncGenerator<StreamEvent> {
+      yield { type: 'start' };
+      yield { type: 'delta', text: '부분' };
+      await new Promise<void>((resolve) => {
+        parked = true;
+        resume = resolve;
+      });
+      yield { type: 'delta', text: ' 늦은 토큰' };
+      yield { type: 'done', stopReason: 'completed' };
+    };
+    const desk = new DeskController({ demo });
+    await desk.init();
+    const sending = desk.send('중간에 멈추는 응답');
+    await waitUntil(() => parked, 'the parked stream');
+    expect(desk.stop()).toBe(1);
+    resume();
+    await sending;
+
+    const slot = lastSlots(desk)[0];
+    expect(slot.status).toBe('canceled');
+    expect(slot.text).toBe('부분');
+    expect(slot.endedAt).toBeTypeOf('number');
+  });
+
+  it('retries a canceled slot and streams again', async () => {
+    const desk = slowDesk(1);
+    await desk.init();
+    const sending = desk.send('SSE 응답에서 청크가 프레임 중간에서 끊기면 어떻게 처리해야 해?');
+    await waitUntil(() => (lastSlots(desk)[0]?.text.length ?? 0) > 0, 'the first token');
+    desk.stop();
+    await sending;
+
+    const state = desk.getSnapshot();
+    const conversation = state.conversations.find((entry) => entry.id === state.activeId)!;
+    const message = [...conversation.messages].reverse().find((entry) => entry.slots && entry.slots.length > 0)!;
+    const slotId = message.slots![0].id;
+    const retry = desk.retrySlot(conversation.id, message.id, slotId);
+    await waitUntil(() => (lastSlots(desk)[0]?.text.length ?? 0) > 0, 'the retried tokens');
+    await retry;
+
+    const slot = lastSlots(desk)[0];
+    expect(slot.status).toBe('done');
+    expect(slot.text.length).toBeGreaterThan(0);
+    expect(slot.error).toBeUndefined();
+  });
+
+  it('honours a transport that ends the turn as canceled on its own', async () => {
+    const demo = new DemoTransport({ sleep: async () => undefined });
+    demo.streamTurn = async function* (): AsyncGenerator<StreamEvent> {
+      yield { type: 'start' };
+      yield { type: 'delta', text: '부분 응답' };
+      yield { type: 'done', stopReason: 'canceled' };
+    };
+    const desk = new DeskController({ demo });
+    await desk.init();
+    await desk.send('중간에 멈추는 응답');
+    const slot = lastSlots(desk)[0];
+    expect(slot.status).toBe('canceled');
+    expect(slot.text).toBe('부분 응답');
+  });
+});
