@@ -35,7 +35,7 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 ![사이드바이드 비교 — 같은 프롬프트, 두 라우트](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/compare.png)
 
-## 지금 되는 것 (Step 2 MVP + 에이전트 제어 + 세션/메모리 운영 + 커맨드 팔레트)
+## 지금 되는 것 (Step 2 MVP + 에이전트 제어 + 세션/메모리 운영 + 커맨드 팔레트 + 인스펙터·시나리오)
 
 - **전송 계층 3개, UI는 하나.** 같은 이벤트로 수렴한다.
   - `daemon` — `damon-agent-core` 실제 표면. `GET /health` → `POST /v1/ws_ticket` → `GET /ws`(JSON-RPC v2). `session.list`/`session.create`/`session.messages`/`session.fork`, `turn.start` + `session.event` 스트리밍, `turn.steer`/`turn.cancel`, `plan.list`/`plan.respond`, `session.rename`/`session.set_archived`/`session.delete`/`session.export`, `memory.list`/`memory.usage`/`memory.write`/`memory.remove`/`memory.approve`/`memory.reject`, `permission.respond`.
@@ -54,9 +54,15 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 - **계획 승인 카드 (`plan.respond`)**: `kind: plan` 승인 요청(Claude의 ExitPlanMode)은 계획 원문을 구조화해 단계·변경 파일·리스크로 보여준다. `approve`/`request changes`/`defer` 세 갈래로 응답하고, 수정 요청은 문장이 deny 메시지로 그대로 전달된다. `plan.list`로 얻은 `planId`+`revision`(CAS)으로 보내므로 다른 서피스가 먼저 결정하면 `-32009` 충돌을 카드에 표시한다. `permission_resolved`가 오면 카드는 더 이상 답할 수 없는 상태로 닫힌다.
 - **턴 단위 분기 (`session.fork`)**: 답변 카드의 `branch` 버튼이 그 턴까지의 대화를 새 세션으로 복사하고, 데스크는 그 복사본을 새 대화로 연다(제목 `… (fork)`, 상단 `branch` 배지). 원본 세션은 그대로 이어간다.
 - **승인 카드**: 데몬이 `permission_requested`를 보내면 카드에 액션 버튼이 뜨고 `permission.respond`로 응답한다.
-- 단위 테스트 223개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러).
+- **실시간 JSON-RPC 인스펙터 (`⌘I` / `Ctrl+I`)**: 헤더의 `JSON-RPC` 토글(프레임 수 배지)로 우측 드로어를 연다. 데모·데몬(`/ws`)·OpenAI 모드에서 실제로 오간 프레임을 타임스탬프·방향(`→ TX` / `← RX`)·메서드·지연(ms)·크기와 함께 스트리밍으로 보여준다 — `turn.start` 요청과 응답(턴이 끝날 때 응답하므로 지연이 곧 턴 길이), `session.event` 푸시(`timeline.assistant_message`·`tool_call`·`permission_requested`), `turn.steer`, `turn.cancel`, `session.fork`, `plan.respond`, OpenAI 모드의 `POST /v1/chat/completions` + SSE 청크까지. 행을 누르면 페이로드 JSON이 펼쳐지고, `전체 / TX / RX / 툴·승인` 필터·`clear`·`copy`(프레임 전체를 JSON 블록으로)·`follow`(자동 스크롤)를 제공한다. 데몬 모드에서는 `RpcClient`가, 데모에서는 시뮬레이터가 같은 봉투를 탭에 기록하므로 **데모와 실 데몬의 프레임이 같은 화면에서 비교된다**.
+- **실전 에이전트 시나리오 3종**: 헤더 `▸ 시나리오`(또는 커맨드 팔레트)에서 1클릭으로 실행한다. ① **코드 리팩토링** — 380줄 웹훅 핸들러를 `Read`/`Grep`으로 진단하고 계획 카드를 띄운 뒤, 승인하면 `Edit`/`Write`와 `npm test`·`tsc`까지 이어서 실행한다. ② **PR 리뷰** — PR diff·라우트·캐시 구현을 읽고 보안(P1 텐넌트 스코프 누락)·성능·정합성 코멘트와 머지 판단을 남긴다. ③ **장애 분석** — OOMKilled 파드 로그·이벤트·Grafana 메트릭을 시간순으로 맞춰 502의 원인을 특정하고, 승인하면 큐 상한·본문 제한 핫픽스를 적용한다. 각 실행은 데모에서 스크립트를 재생하고(툴 아코디언·계획 카드·`turn.steer` 포함), 데몬·OpenAI 연결에서는 같은 프롬프트를 실제 에이전트에 보낸다.
+- 단위 테스트 252개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러·와이어 탭/프레임 필터·시나리오 스크립트·시나리오 실행·계획 승인 후속 실행·인스펙터 렌더).
 
 ![커맨드 팔레트 — ⌘K로 새 대화·세션·split·memory·내보내기·라우트를 한 번에](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/command-palette.png)
+
+![JSON-RPC 인스펙터 — 툴 호출·계획 카드 옆에서 실제 프레임이 흐른다](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/inspector.png)
+
+![실전 시나리오 — 리팩토링·PR 리뷰·장애 분석 1클릭 실행](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/scenarios.png)
 
 ![에이전트 제어 — 툴 결과 뷰어·턴 스티어·계획 승인 카드](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/agent-controls.png)
 

@@ -10,6 +10,7 @@
 
 import type { DeskState } from './desk';
 import type { ExportFormat } from './export';
+import { SCENARIOS, type ScenarioId } from './scenarios';
 import { conversationMeta } from './sessions';
 
 export type CommandGroup = 'action' | 'session' | 'route';
@@ -40,6 +41,10 @@ export interface PaletteHandlers {
   setPrimary: (key: string) => void;
   setSecondary: (key: string) => void;
   stop: () => void;
+  /** Play one real-work scenario (demo) or send it as a prompt (live). */
+  runScenario: (id: ScenarioId) => void;
+  toggleInspector: () => void;
+  openScenarios: () => void;
 }
 
 export const GROUP_LABELS: Record<CommandGroup, string> = {
@@ -77,6 +82,31 @@ export function buildCommands(state: DeskState, handlers: PaletteHandlers): Pale
       keywords: 'new chat 새 대화 시작 create',
       run: handlers.newConversation,
     },
+    {
+      id: 'action.inspector',
+      group: 'action',
+      label: state.inspector.open ? '프로토콜 인스펙터 닫기' : '프로토콜 인스펙터 열기',
+      detail: state.inspector.open ? 'on' : 'JSON-RPC v2 · SSE',
+      keywords: 'inspector 인스펙터 프로토콜 프레임 wire 디버그 패널 json-rpc',
+      run: handlers.toggleInspector,
+    },
+    {
+      id: 'action.scenarios',
+      group: 'action',
+      label: '실전 시나리오 열기',
+      detail: `${SCENARIOS.length}개`,
+      keywords: 'scenario 시나리오 리팩토링 refactor pr review 장애 incident 실행',
+      run: handlers.openScenarios,
+    },
+    ...SCENARIOS.map((scenario) => ({
+      id: `scenario.${scenario.id}`,
+      group: 'action' as const,
+      label: `시나리오 — ${scenario.title}`,
+      detail: scenario.label,
+      keywords: `scenario 시나리오 실행 ${scenario.id} ${scenario.label} ${scenario.title} ${scenario.tools.join(' ')}`,
+      disabled: state.busy,
+      run: () => handlers.runScenario(scenario.id),
+    })),
     {
       id: 'action.compare',
       group: 'action',

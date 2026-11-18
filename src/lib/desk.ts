@@ -11,11 +11,13 @@ import { DEMO_ROUTES, DemoTransport, composeReply } from './demo';
 import { probe } from './detect';
 import { buildExport, type ExportFormat, type ExportPayload } from './export';
 import { needsDemoFallback, pageOrigin } from './hosting';
+import { WireTap, type InspectorFilter } from './inspector';
 import { memoryErrorInfo } from './memory';
 import { listModels, streamChat } from './openai';
 import { loadState, saveState, safeStorage, type SavedState } from './persistence';
 import { planStatusFor } from './plan';
 import { RpcError } from './rpc';
+import { scenarioById, type ScenarioBeat, type ScenarioId } from './scenarios';
 import { makeTarget } from './targets';
 import { mergeToolCall } from './tools';
 import type {
@@ -74,6 +76,8 @@ export interface DeskState {
   primaryKey: string | null;
   secondaryKey: string | null;
   sidebarOpen: boolean;
+  /** The JSON-RPC inspector drawer: open state and the active chip. */
+  inspector: { open: boolean; filter: InspectorFilter };
   busy: boolean;
   savedMasterToken?: string;
   savedDeviceToken?: string;
@@ -91,6 +95,8 @@ export interface DeskDeps {
   demo?: DemoTransport;
   fetchImpl?: typeof fetch;
   socketFactory?: import('./rpc').SocketFactory;
+  /** Injectable so a test can read the frames the desk recorded. */
+  wire?: WireTap;
 }
 
 let counter = 0;
@@ -122,14 +128,20 @@ export class DeskController {
   private aborters = new Map<string, AbortController>();
   /** slotId → where it lives, so a stop can mark it without a scan. */
   private slotIndex = new Map<string, { convId: string; messageId: string }>();
+  /** slotId → how the turn is played (scenario script, plan follow-up, new session). */
+  private slotMeta = new Map<string, { scenario?: ScenarioId; newSession?: boolean; followUp?: ScenarioBeat[] }>();
   /** Slots stopped by hand — late tokens from the wire are dropped. */
   private stoppedSlots = new Set<string>();
   private emitTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Every frame the desk speaks, for the inspector. */
+  readonly wire: WireTap;
 
   constructor(deps: DeskDeps = {}) {
     this.deps = deps;
     this.storage = deps.storage ?? safeStorage();
+    this.wire = deps.wire ?? new WireTap();
     this.demo = deps.demo ?? new DemoTransport();
+    this.demo.setTap(this.wire);
     const saved = loadState(this.storage);
     this.state = {
       connection: {
@@ -158,6 +170,7 @@ export class DeskController {
       primaryKey: saved?.settings.primaryKey ?? null,
       secondaryKey: saved?.settings.secondaryKey ?? null,
       sidebarOpen: false,
+      inspector: { open: false, filter: 'all' },
       busy: false,
       savedMasterToken: saved?.settings.masterToken,
       savedDeviceToken: saved?.settings.deviceToken,
@@ -383,7 +396,7 @@ export class DeskController {
     if (result.kind === 'daemon') {
       const daemon = new DaemonTransport(
         { baseUrl: base, masterToken: opts.masterToken, deviceToken: opts.deviceToken },
-        { fetchImpl: this.deps.fetchImpl, socketFactory: this.deps.socketFactory },
+        { fetchImpl: this.deps.fetchImpl, socketFactory: this.deps.socketFactory, tap: this.wire },
       );
       try {
         const hello = await daemon.connect();
@@ -427,7 +440,7 @@ export class DeskController {
     try {
       const targets = result.targets?.length
         ? result.targets
-        : await listModels({ baseUrl: base, apiKey: opts.masterToken, fetchImpl: this.deps.fetchImpl });
+        : await listModels({ baseUrl: base, apiKey: opts.masterToken, fetchImpl: this.deps.fetchImpl, tap: this.wire });
       this.daemon?.close();
       this.daemon = null;
       this.setStateConnection({
@@ -907,6 +920,24 @@ export class DeskController {
     return payload;
   }
 
+  /* ---------------------------------------------------------------- */
+  /* inspector — open/filter, and the wire the panel reads              */
+  /* ---------------------------------------------------------------- */
+
+  toggleInspector(open?: boolean): void {
+    const next = open ?? !this.state.inspector.open;
+    this.set({ inspector: { ...this.state.inspector, open: next } });
+  }
+
+  setInspectorFilter(filter: InspectorFilter): void {
+    this.set({ inspector: { ...this.state.inspector, filter } });
+  }
+
+  clearWire(): void {
+    this.wire.clear();
+    this.set({ notice: '인스펙터 로그를 비웠습니다' });
+  }
+
   /** Tell the user something the UI did outside the controller (copy/save). */
   notify(message: string): void {
     this.set({ notice: message });
@@ -1075,6 +1106,7 @@ export class DeskController {
 
     const now = Date.now();
     const conversation = this.ensureConversation(text);
+    const firstTurn = conversation.messages.length === 0;
     const mode = targets.length > 1 ? 'compare' : 'single';
     const userMessage: ChatMessage = {
       id: uid('m'),
@@ -1119,9 +1151,94 @@ export class DeskController {
     this.persist();
 
     await Promise.all(
-      targets.map((target, index) => this.runSlot(conversation.id, assistantMessage.id, slots[index].id, target, text)),
+      targets.map((target, index) =>
+        this.runSlot(conversation.id, assistantMessage.id, slots[index].id, target, text, { newSession: firstTurn }),
+      ),
     );
 
+    this.set({ busy: false });
+    this.persist();
+  }
+
+  /**
+   * Launch one of the three real-work scenarios in a fresh conversation.
+   *
+   * In demo mode the transport plays the scripted run — prose, tool
+   * calls, a plan to approve, then the edit. On a live daemon or an
+   * OpenAI endpoint the same prompt is sent for real: the scenario is a
+   * brief, not a movie, so the agent does the work itself.
+   */
+  async runScenario(id: ScenarioId): Promise<void> {
+    const scenario = scenarioById(id);
+    if (!scenario) return;
+    if (this.state.busy) {
+      this.set({ notice: '진행 중인 턴이 끝난 뒤에 시나리오를 실행할 수 있습니다' });
+      return;
+    }
+    if (this.state.connection.transport !== 'demo') {
+      this.newConversation();
+      await this.send(scenario.prompt);
+      return;
+    }
+
+    const targets = this.selectedTargets();
+    if (targets.length === 0) {
+      this.set({ notice: '시나리오를 실행할 라우트가 없습니다' });
+      return;
+    }
+    const target = targets[0];
+    const now = Date.now();
+    const conversation: Conversation = {
+      id: uid('conv'),
+      title: scenario.title,
+      createdAt: now,
+      updatedAt: now,
+      messages: [],
+      daemonSessions: {},
+    };
+    const userMessage: ChatMessage = {
+      id: uid('m'),
+      role: 'user',
+      text: scenario.prompt,
+      createdAt: now,
+      mode: 'single',
+      memoryInjected: this.state.memory.enabled && this.state.memory.entries.length > 0,
+    };
+    const slot: ReplySlot = {
+      id: uid('slot'),
+      target,
+      text: '',
+      status: 'queued',
+      startedAt: now,
+      notice: `시나리오 ${scenario.index} · ${scenario.label}`,
+    };
+    const assistantMessage: ChatMessage = {
+      id: uid('m'),
+      role: 'assistant',
+      createdAt: now,
+      mode: 'single',
+      slots: [slot],
+    };
+    conversation.messages = [userMessage, assistantMessage];
+
+    this.set({
+      conversations: [conversation, ...this.state.conversations],
+      activeId: conversation.id,
+      busy: true,
+      sidebarOpen: false,
+    });
+    this.demo.addSession({
+      sessionId: conversation.id,
+      backend: target.provider,
+      title: scenario.title,
+      createdAt: now,
+    });
+    this.persist();
+
+    await this.runSlot(conversation.id, assistantMessage.id, slot.id, target, scenario.prompt, {
+      scenario: id,
+      newSession: true,
+    });
     this.set({ busy: false });
     this.persist();
   }
@@ -1162,10 +1279,18 @@ export class DeskController {
     return history.slice(-24);
   }
 
-  private async runSlot(convId: string, messageId: string, slotId: string, target: RouteTarget, prompt: string): Promise<void> {
+  private async runSlot(
+    convId: string,
+    messageId: string,
+    slotId: string,
+    target: RouteTarget,
+    prompt: string,
+    meta: { scenario?: ScenarioId; newSession?: boolean; followUp?: ScenarioBeat[] } = {},
+  ): Promise<void> {
     const aborter = new AbortController();
     this.aborters.set(slotId, aborter);
     this.slotIndex.set(slotId, { convId, messageId });
+    this.slotMeta.set(slotId, meta);
     // A retry reuses the slot id; it must not inherit the last stop.
     this.stoppedSlots.delete(slotId);
     this.patchSlot(convId, messageId, slotId, { status: 'streaming', startedAt: Date.now() });
@@ -1196,6 +1321,7 @@ export class DeskController {
     } finally {
       this.aborters.delete(slotId);
       this.slotIndex.delete(slotId);
+      this.slotMeta.delete(slotId);
       this.stoppedSlots.delete(slotId);
     }
   }
@@ -1209,11 +1335,18 @@ export class DeskController {
     slotRef: { messageId: string; slotId: string },
   ): Promise<AsyncGenerator<StreamEvent>> {
     const transport = this.state.connection.transport;
+    const meta = this.slotMeta.get(slotRef.slotId);
     if (transport === 'demo') {
+      if (meta?.followUp) {
+        return this.demo.resumeBeats(meta.followUp, target, { signal, sessionId: convId });
+      }
       return this.demo.streamTurn(outgoing, target, {
         signal,
         composeFrom: prompt,
         steerKey: target.key,
+        sessionId: convId,
+        newSession: meta?.newSession === true,
+        scenario: meta?.scenario,
       });
     }
     if (transport === 'openai') {
@@ -1224,6 +1357,7 @@ export class DeskController {
         apiKey: this.state.savedMasterToken,
         fetchImpl: this.deps.fetchImpl,
         signal,
+        tap: this.wire,
         request: {
           model: target.model,
           messages: [...history, { role: 'user', content: outgoing }],
@@ -1554,6 +1688,8 @@ export class DeskController {
     try {
       let reported: string | undefined;
       let revision = plan.revision;
+      /** The beats an approved plan continues with (demo script). */
+      let followUp: ScenarioBeat[] | undefined;
       if (transport === 'demo') {
         const result = await this.demo.respondPlan({
           planId: plan.planId ?? plan.id,
@@ -1563,6 +1699,7 @@ export class DeskController {
         });
         reported = result.status;
         revision = result.revision;
+        if (decision === 'approve') followUp = this.demo.takeResume(plan.planId ?? plan.id);
       } else if (transport === 'daemon' && this.daemon) {
         if (plan.planId) {
           try {
@@ -1616,6 +1753,9 @@ export class DeskController {
       );
       this.set({ notice: `계획 ${status === 'approved' ? '승인' : status === 'deferred' ? '보류' : '수정 요청'} 전달됨` });
       this.persist();
+      if (followUp && followUp.length > 0 && slot) {
+        await this.runPlanFollowUp(ref, slot.target, followUp, plan.planId ?? plan.id);
+      }
     } catch (error) {
       const message = (error as Error).message;
       this.patchSlot(ref.convId, ref.messageId, ref.slotId, (current) => ({
@@ -1625,10 +1765,48 @@ export class DeskController {
     }
   }
 
+  /**
+   * An approved plan is not the end of the turn: the agent runs the
+   * beats it parked. They stream as a new assistant message under the
+   * card, so the file edits and the tests they ran stay in one view.
+   */
+  private async runPlanFollowUp(
+    ref: { convId: string; messageId: string; slotId: string },
+    target: RouteTarget,
+    beats: ScenarioBeat[],
+    planId: string,
+  ): Promise<void> {
+    const conversation = this.state.conversations.find((entry) => entry.id === ref.convId);
+    if (!conversation) return;
+    const now = Date.now();
+    const messageId = uid('m');
+    const slotId = uid('slot');
+    const message: ChatMessage = {
+      id: messageId,
+      role: 'assistant',
+      createdAt: now,
+      mode: 'single',
+      slots: [
+        {
+          id: slotId,
+          target,
+          text: '',
+          status: 'queued',
+          startedAt: now,
+          notice: `승인된 계획 실행 · ${planId}`,
+        },
+      ],
+    };
+    this.patchConversation(ref.convId, { messages: [...conversation.messages, message], updatedAt: now });
+    this.set({ busy: true });
+    await this.runSlot(ref.convId, messageId, slotId, target, `(approved plan) ${planId}`, { followUp: beats });
+    this.set({ busy: false });
+    this.persist();
+  }
+
   /* ---------------------------------------------------------------- */
   /* session.fork — branch the conversation at a turn                   */
   /* ---------------------------------------------------------------- */
-
   /**
    * Fork the conversation at an assistant turn. The daemon copies the
    * session (messages, tags, usage, resume handle) and the desk opens the

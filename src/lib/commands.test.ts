@@ -25,6 +25,9 @@ function handlers(): PaletteHandlers {
     setPrimary: vi.fn(),
     setSecondary: vi.fn(),
     stop: vi.fn(),
+    runScenario: vi.fn(),
+    toggleInspector: vi.fn(),
+    openScenarios: vi.fn(),
   };
 }
 
