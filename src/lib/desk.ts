@@ -289,7 +289,7 @@ export class DeskController {
       transport: 'demo',
       status: 'live',
       baseUrl: 'demo://simulated',
-      version: 'damon-agent-core 0.7.2 (simulated)',
+      version: 'damon-agent-core 0.8.0 (simulated)',
       targets,
       probeNote: note ?? 'simulated daemon — no network, no keys',
     });
