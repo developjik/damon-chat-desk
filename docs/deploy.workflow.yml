@@ -1,11 +1,9 @@
-# GitHub Pages 자동 배포 워크플로.
+# GitHub Pages 자동 배포 워크플로 — 참고용 사본.
 #
-# 이 파일은 `.github/workflows/deploy.yml`로 옮겨야 동작한다.
-# (지금은 커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로
-#  푸시할 수 없다 — 웹 에디터에서 복사해 넣으면 그대로 동작한다.)
-#
-# Settings → Pages → Source: GitHub Actions 로 한 번 지정한 뒤,
-# main에 푸시할 때마다 테스트·빌드·배포가 돈다.
+# 실제로 도는 파일은 `.github/workflows/deploy.yml`이다. Settings → Pages → Source가
+# GitHub Actions로 지정되어 있고, main에 푸시할 때마다 테스트·빌드·배포가 돈다.
+# 이 사본은 문서에서 바로 읽어 보라고 둔 것이며, 복사해서 쓰는 파일이 아니다 —
+# 고칠 때는 두 파일을 같이 고친다.
 #
 # 빌드 단계의 VITE_BASE_PATH가 이 리포의 Pages 경로(/damon-chat-desk/)를
 # vite base로 넘긴다 — 없으면 asset이 /assets/로 나가 404가 된다.

@@ -4,7 +4,13 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 그냥 채팅 UI가 아니다. 프로바이더 라우팅이 눈에 보이는, Damon이라서 되는 채팅 데스크.
 
-![기본 채팅 — 라우팅 배지가 붙은 응답](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/chat.png)
+## ▶ Live Demo
+
+**[developjik.github.io/damon-chat-desk](https://developjik.github.io/damon-chat-desk/)** — 설치도 키도 없이 브라우저에서 바로. 열면 데모 모드(4개 프로바이더 시뮬레이션)로 대화가 시작된다.
+
+[![Deploy to GitHub Pages](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml/badge.svg)](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml)
+
+![라이브 데모 — 라우팅 배지가 붙은 응답](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/chat.png)
 
 ## 구조
 
@@ -73,7 +79,7 @@ npm run build      # dist/ (base /)  — Pages는 VITE_BASE_PATH=/damon-chat-des
 
 base 경로는 `VITE_BASE_PATH` 하나로 정한다: 개발·프리뷰는 `/`, GitHub Pages 프로젝트 페이지는
 `/damon-chat-desk/`. 같은 명령에 환경변수만 다르게 주면 asset URL이 그에 맞게 나온다(워크플로는
-[`docs/deploy.workflow.yml`](docs/deploy.workflow.yml)에 반영되어 있다).
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)이 같은 값을 넘겨 빌드한다).
 
 ### 데몬에 붙이기
 
@@ -105,16 +111,27 @@ npm run dev                                # 데스크 실행
 
 ## 배포
 
-빌드 산출물은 `dist/`다. `VITE_BASE_PATH=/damon-chat-desk/ npm run build`로 만들면 asset 경로가
-프로젝트 페이지에 그대로 맞는다(기본값 `/`).
-자동 배포 워크플로는 [`docs/deploy.workflow.yml`](docs/deploy.workflow.yml)에 있다 —
-`.github/workflows/deploy.yml`로 복사하고 Settings → Pages → Source를 **GitHub Actions**로
-한 번 지정하면 `main` 푸시마다 테스트·빌드·배포가 돈다.
+**`main`에 푸시하면 GitHub Actions가 테스트·빌드·배포까지 돌고, 결과가
+<https://developjik.github.io/damon-chat-desk/> 에 올라간다.** 워크플로는
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) 하나이고, `push`(main)와 수동 실행
+(`workflow_dispatch`)을 받는다. 실행 기록은 [Actions 탭](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml)에서 본다.
 
-지금 이 PR에는 워크플로 파일을 넣지 않았다: 푸시 주체(GitHub App)에 `workflows` 스코프가 없어
-`.github/workflows/` 경로의 푸시가 거부되기 때문이다. 파일을 옮기는 것만으로 동작한다.
+- Settings → Pages → Source는 **GitHub Actions**로 지정되어 있다(`build_type: workflow`). `gh-pages` 브랜치는 쓰지 않는다.
+- 단계: `npm ci` → `npm test`(223개) → `npm run build` → `upload-pages-artifact` → `deploy-pages`. 테스트가 깨지면 배포도 나가지 않는다.
+- 빌드 단계가 `VITE_BASE_PATH=/damon-chat-desk/`를 넘긴다. 이 값이 없으면 asset이 `/assets/…`로 나가 프로젝트 페이지에서 404가 된다.
+- 산출물은 `dist/` 정적 파일뿐이고, 중간 서버도 서버 비용도 없다.
 
-수동 배포는 `npm run build` 후 `dist/`를 Pages에 올리면 된다.
+Pages와 같은 빌드를 로컬에서 확인하려면:
+
+```bash
+VITE_BASE_PATH=/damon-chat-desk/ npm run build
+VITE_BASE_PATH=/damon-chat-desk/ npm run preview   # http://127.0.0.1:4173/damon-chat-desk/
+```
+
+수동 배포가 필요하면 `workflow_dispatch`로 같은 워크플로를 한 번 돌리면 된다(`dist/`를 직접 올릴 일은 없다).
+
+`.github/workflows/` 경로는 푸시 주체에 `workflows` 스코프가 없으면 거부된다. 워크플로를 고칠 때는 그
+권한이 있는 계정이나 웹 에디터를 쓴다. `docs/deploy.workflow.yml`은 같은 파일의 참고용 사본이다.
 
 ## 검증 도구
 
@@ -139,7 +156,7 @@ python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SS
 
 ## 데몬 표면과의 정렬
 
-이 클라이언트는 `damon-agent-core`의 실제 구현을 기준으로 맞췄다(`src/api.rs`, `docs/protocol-v2.md`).
+이 클라이언트는 `damon-agent-core` **v0.8.0**(`Cargo.toml` `version = "0.8.0"`, 릴리스 `v0.8.0`)의 실제 구현을 기준으로 맞췄다(`src/api.rs`, `docs/protocol-v2.md`).
 
 | 표면 | 쓰임 |
 | --- | --- |
@@ -163,6 +180,8 @@ python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SS
 - 의존성은 react/react-dom 뿐. 마크다운 렌더러·SSE 파서·JSON-RPC 클라이언트·데모 시뮬레이터는 직접 구현
 - 다크 터미널 미학 (JetBrains Mono 계열 모노스페이스, 1px 보더, 고밀도 데이터 뷰)
 - 1440px 데스크톱 / 390px 모바일 모두 동작 (사이드바 드로어, 비교 모드 세로 스택)
+
+![모바일 390px — 한 손으로 쓰는 같은 데스크](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/mobile.png)
 
 ## 게이트 확정 (이 레포가 증명하는 것)
 
