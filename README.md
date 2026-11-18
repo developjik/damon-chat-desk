@@ -6,7 +6,7 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 ## ▶ Live Demo
 
-**[developjik.github.io/damon-chat-desk](https://developjik.github.io/damon-chat-desk/)** — 설치도 키도 없이 브라우저에서 바로. 열면 데모 모드(4개 프로바이더 시뮬레이션)로 대화가 시작된다.
+**[developjik.github.io/damon-chat-desk](https://developjik.github.io/damon-chat-desk/)** — 설치도 키도 없이 브라우저에서 바로. 열면 데모 모드(4개 프로바이더 시뮬레이션)로 대화가 시작된다. 헤더의 `▸ 시나리오`로 실전 시나리오 3종을 1클릭 실행하고, `JSON-RPC` 토글로 그 순간의 프레임을 옆에서 볼 수 있다.
 
 [![Deploy to GitHub Pages](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml/badge.svg)](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml)
 
