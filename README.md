@@ -27,6 +27,54 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 브라우저가 로컬 데몬을 직접 호출한다. 중간 서버 없음, 서버 비용 0.
 
+### `/ws` 한 턴의 실제 프레임
+
+데몬(`damon-agent-core`)과 이 데스크가 주고받는 순서 그대로다. 왼쪽이 브라우저, 오른쪽이
+`127.0.0.1:9470`의 데몬이다. 헤더의 `JSON-RPC` 인스펙터(`⌘I`)를 열어 두면 같은 프레임이
+같은 순서로 흐르는 걸 볼 수 있다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as damon-chat-desk 브라우저
+    participant D as Damon daemon 127.0.0.1:9470
+
+    UI->>D: GET /health
+    D-->>UI: 200 status · version · backends
+    Note over UI,D: backends가 있으면 daemon 표면, 없으면 OpenAI 호환 표면
+    UI->>D: POST /v1/ws_ticket — Bearer 마스터 토큰 또는 deviceToken
+    D-->>UI: 200 ticket — 60초 · 1회용
+    UI->>D: GET /ws?ticket=… — WebSocket 업그레이드
+    D-->>UI: hello — protocol 2 · daemon · version · backends · methods
+    UI->>D: turn.start — sessionId · prompt · route
+    D-->>UI: session.event · turn_started
+    loop 토큰 스트리밍
+        D-->>UI: session.event · timeline.assistant_message — 델타 1개
+    end
+    D-->>UI: session.event · timeline.tool_call — call_id · name · detail
+    D-->>UI: session.event · permission_requested — kind tool / question / plan
+    UI->>D: permission.respond — requestId · action
+    D-->>UI: session.event · permission_resolved
+    opt 계획 승인 — kind plan
+        UI->>D: plan.list — sessionId
+        D-->>UI: plans — planId · revision
+        UI->>D: plan.respond — planId · expectedRevision · decision
+        Note over UI,D: 다른 서피스가 먼저 결정하면 -32009 CAS 충돌
+    end
+    opt 턴 중 방향 수정 또는 중단
+        UI->>D: turn.steer — sessionId · text
+        UI->>D: turn.cancel — sessionId
+    end
+    D-->>UI: session.event · turn_completed — usage
+    D-->>UI: turn.start result — turnId · stopReason · usage
+    Note over UI,D: turn.start의 응답은 턴이 끝날 때 온다 — 지연이 곧 턴 길이
+```
+
+한 턴에 `timeline.assistant_message` 델타가 100개 넘게 쌓이므로, 인스펙터는 **연속된 델타를
+한 행으로 접는다**(`← RX session.event ×98 deltas · 2.4s · 11.8KB`). 접힌 행을 누르면 개별 델타
+프레임이 펼쳐지고, `group` 토글로 접기를 끌 수 있다. 툴 호출·승인 요청·계획 응답은 접히지 않아
+델타 더미에 묻히지 않는다.
+
 ## 원칙
 
 1. UI는 얇다. 상태(세션·메모리)는 데몬에, UI는 렌더만.
@@ -60,13 +108,15 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 - **계획 승인 카드 (`plan.respond`)**: `kind: plan` 승인 요청(Claude의 ExitPlanMode)은 계획 원문을 구조화해 단계·변경 파일·리스크로 보여준다. `approve`/`request changes`/`defer` 세 갈래로 응답하고, 수정 요청은 문장이 deny 메시지로 그대로 전달된다. `plan.list`로 얻은 `planId`+`revision`(CAS)으로 보내므로 다른 서피스가 먼저 결정하면 `-32009` 충돌을 카드에 표시한다. `permission_resolved`가 오면 카드는 더 이상 답할 수 없는 상태로 닫힌다.
 - **턴 단위 분기 (`session.fork`)**: 답변 카드의 `branch` 버튼이 그 턴까지의 대화를 새 세션으로 복사하고, 데스크는 그 복사본을 새 대화로 연다(제목 `… (fork)`, 상단 `branch` 배지). 원본 세션은 그대로 이어간다.
 - **승인 카드**: 데몬이 `permission_requested`를 보내면 카드에 액션 버튼이 뜨고 `permission.respond`로 응답한다.
-- **실시간 JSON-RPC 인스펙터 (`⌘I` / `Ctrl+I`)**: 헤더의 `JSON-RPC` 토글(프레임 수 배지)로 우측 드로어를 연다. 데모·데몬(`/ws`)·OpenAI 모드에서 실제로 오간 프레임을 타임스탬프·방향(`→ TX` / `← RX`)·메서드·지연(ms)·크기와 함께 스트리밍으로 보여준다 — `turn.start` 요청과 응답(턴이 끝날 때 응답하므로 지연이 곧 턴 길이), `session.event` 푸시(`timeline.assistant_message`·`tool_call`·`permission_requested`), `turn.steer`, `turn.cancel`, `session.fork`, `plan.respond`, OpenAI 모드의 `POST /v1/chat/completions` + SSE 청크까지. 행을 누르면 페이로드 JSON이 펼쳐지고, `전체 / TX / RX / 툴·승인` 필터·`clear`·`copy`(프레임 전체를 JSON 블록으로)·`follow`(자동 스크롤)를 제공한다. 데몬 모드에서는 `RpcClient`가, 데모에서는 시뮬레이터가 같은 봉투를 탭에 기록하므로 **데모와 실 데몬의 프레임이 같은 화면에서 비교된다**.
+- **실시간 JSON-RPC 인스펙터 (`⌘I` / `Ctrl+I`)**: 헤더의 `JSON-RPC` 토글(프레임 수 배지)로 우측 드로어를 연다. 데모·데몬(`/ws`)·OpenAI 모드에서 실제로 오간 프레임을 타임스탬프·방향(`→ TX` / `← RX`)·메서드·지연(ms)·크기와 함께 스트리밍으로 보여준다 — `turn.start` 요청과 응답(턴이 끝날 때 응답하므로 지연이 곧 턴 길이), `session.event` 푸시(`timeline.assistant_message`·`tool_call`·`permission_requested`), `turn.steer`, `turn.cancel`, `session.fork`, `plan.respond`, OpenAI 모드의 `POST /v1/chat/completions` + SSE 청크까지. **연속된 텍스트 델타는 한 행으로 접힌다** — `← RX session.event ×98 deltas · 2.4s · 11.8KB`처럼 개수·경과 시간·바이트를 붙여 한 줄로 묶고, 누르면 개별 델타 프레임이 펼쳐진다. 툴 호출·승인 요청·계획 응답 같은 프레임이 끼면 접힘이 끊기므로 핵심 프레임이 델타 더미에 묻히지 않고, `group` 토글로 접기를 끄면 예전처럼 프레임 1개 = 행 1개다. 행을 누르면 페이로드 JSON이 펼쳐지고, `전체 / TX / RX / 툴·승인` 필터·`group`·`clear`·`copy`(프레임 전체를 JSON 블록으로)·`follow`(자동 스크롤)를 제공한다. 데몬 모드에서는 `RpcClient`가, 데모에서는 시뮬레이터가 같은 봉투를 탭에 기록하므로 **데모와 실 데몬의 프레임이 같은 화면에서 비교된다**.
 - **실전 에이전트 시나리오 3종**: 헤더 `▸ 시나리오`(또는 커맨드 팔레트)에서 1클릭으로 실행한다. ① **코드 리팩토링** — 380줄 웹훅 핸들러를 `Read`/`Grep`으로 진단하고 계획 카드를 띄운 뒤, 승인하면 `Edit`/`Write`와 `npm test`·`tsc`까지 이어서 실행한다. ② **PR 리뷰** — PR diff·라우트·캐시 구현을 읽고 보안(P1 텐넌트 스코프 누락)·성능·정합성 코멘트와 머지 판단을 남긴다. ③ **장애 분석** — OOMKilled 파드 로그·이벤트·Grafana 메트릭을 시간순으로 맞춰 502의 원인을 특정하고, 승인하면 큐 상한·본문 제한 핫픽스를 적용한다. 각 실행은 데모에서 스크립트를 재생하고(툴 아코디언·계획 카드·`turn.steer` 포함), 데몬·OpenAI 연결에서는 같은 프롬프트를 실제 에이전트에 보낸다.
-- 단위 테스트 254개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러·와이어 탭/프레임 필터·시나리오 스크립트·시나리오 실행·계획 승인 후속 실행·인스펙터 렌더·turn.cancel/session.fork 프레임).
+- 단위 테스트 264개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·데몬 이벤트 매핑·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러·와이어 탭/프레임 필터·델타 그룹핑·시나리오 스크립트·시나리오 실행·계획 승인 후속 실행·인스펙터 렌더·turn.cancel/session.fork 프레임).
 
 ![커맨드 팔레트 — ⌘K로 새 대화·세션·split·memory·내보내기·라우트를 한 번에](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/command-palette.png)
 
 ![JSON-RPC 인스펙터 — 툴 호출·계획 카드 옆에서 실제 프레임이 흐른다](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/inspector.png)
+
+![인스펙터 델타 접기 — 107개 델타가 두 행(×20 · ×87)으로, 툴 호출과 계획 승인은 그대로 보인다](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/inspector-grouped.png)
 
 ![실전 시나리오 — 리팩토링·PR 리뷰·장애 분석 1클릭 실행](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/scenarios.png)
 
@@ -76,39 +126,60 @@ Damon core의 첫 서피스. 데몬의 단일 API 위에 얹는, 얇은 채팅 �
 
 ## 실행
 
+Node 22와 `npm`만 있으면 된다(런타임 의존성은 react/react-dom 둘뿐).
+
+### 1. 클라이언트
+
 ```bash
-npm install
+git clone https://github.com/developjik/damon-chat-desk.git
+cd damon-chat-desk
+npm ci             # lockfile 그대로 설치
 npm run dev        # http://127.0.0.1:5173/  (base 기본값 /)
-npm test           # vitest
-npm run build      # dist/ (base /)  — Pages는 VITE_BASE_PATH=/damon-chat-desk/ npm run build
 ```
+
+| 명령 | 결과 |
+| --- | --- |
+| `npm run dev` | 개발 서버 + `/dm` 프록시(아래) |
+| `npm test` | vitest 전 시나리오 264개 |
+| `npm run typecheck` | `tsc` 타입 검사만 |
+| `npm run build` | `dist/` (base `/`) — 자동 배포는 `VITE_BASE_PATH=/damon-chat-desk/ npm run build` |
+| `npm run preview` | 빌드 결과를 4173에서 확인 |
 
 base 경로는 `VITE_BASE_PATH` 하나로 정한다: 개발·프리뷰는 `/`, GitHub Pages 프로젝트 페이지는
 `/damon-chat-desk/`. 같은 명령에 환경변수만 다르게 주면 asset URL이 그에 맞게 나온다(워크플로는
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)이 같은 값을 넘겨 빌드한다).
 
-### 데몬에 붙이기
+### 2. 데몬에 붙이기 (실제 JSON-RPC v2)
 
-데몬은 기본적으로 `127.0.0.1:9470`에 바인드한다.
+데몬은 기본적으로 `127.0.0.1:9470`에 바인드한다. 터미널 두 개가 편하다.
 
 ```bash
-damond                                     # 데몬 실행 (백엔드 CLI는 각자 로그인)
-npm run dev                                # 데스크 실행
+# 터미널 1 — 데몬 (백엔드 CLI는 각자 로그인)
+damond                                     # GET /health · POST /v1/ws_ticket · GET /ws
+
+# 터미널 2 — 데스크
+npm run dev                                # http://127.0.0.1:5173/
 ```
 
-설정(⚙) → **Damon daemon** → `로컬 프록시 /dm` 버튼. `npm run dev`가 여는 `/dm` 프록시가
-`http://127.0.0.1:9470`으로 넘긴다.
+데스크 화면에서 **설정(⚙) → Damon daemon → `로컬 프록시 /dm`** 를 누른다. `npm run dev`가 여는
+`/dm` 프록시가 `http://127.0.0.1:9470`으로 넘긴다 — 브라우저 입장에서는 같은 오리진이라
+CORS·혼합 콘텐츠에 걸리지 않는다.
+
+1. 데모 모드로 열린 화면에서 ⚙를 열고 `Damon daemon` 탭으로 간다.
+2. `로컬 프록시 /dm` 버튼을 누른다(데몬에 마스터 토큰을 걸었다면 입력창에 먼저 넣는다).
+3. 헤더에 데몬 버전·백엔드가 뜨면 연결된 것 — 사이드바에 데몬 세션 목록과 메모리 원장이 채워진다.
+4. `⌘I`로 인스펙터를 열고 메시지를 보내면 `hello` → `turn.start` → `session.event`가 실제로 흐른다.
 
 ![데몬 연결 — 세션 목록·메모리·라우팅 메트릭](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/daemon.png)
 
 **왜 프록시인가**: 데몬은 CORS 헤더를 보내지 않는다(자기 UI를 `/ui`로 직접 서빙하는 설계).
 다른 오리진의 페이지에서 `fetch`로 직접 부르면 브라우저가 막는다. 그래서
-- 개발/프리뷰에서는 `/dm` 프록시로 **같은 오리진**을 만든다,
+- 개발/프리뷰에서는 `/dm` 프록시로 **같은 오리진**을 만든다(WebSocket도 같은 경로로 프록시된다),
 - 배포된 GitHub Pages 빌드에서는 **demo 모드로 먼저 체험**하고,
 - 원격 데몬은 페어링(`POST /v1/pair` → 승인 → `deviceToken`) 후 같은 오리진 경로로 붙인다.
   페어링 흐름은 설정 패널에 구현되어 있다(8자리 `device.pairing_key` → `pair` → `pair/status` 확인 → 토큰 저장).
 
-### OpenAI 호환 서버에 붙이기
+### 3. OpenAI 호환 서버에 붙이기
 
 ```bash
 # LM Studio(1234), llama.cpp(8080) 등 — CORS를 허용하는 서버
@@ -123,7 +194,7 @@ npm run dev                                # 데스크 실행
 (`workflow_dispatch`)을 받는다. 실행 기록은 [Actions 탭](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml)에서 본다.
 
 - Settings → Pages → Source는 **GitHub Actions**로 지정되어 있다(`build_type: workflow`). `gh-pages` 브랜치는 쓰지 않는다.
-- 단계: `npm ci` → `npm test`(223개) → `npm run build` → `upload-pages-artifact` → `deploy-pages`. 테스트가 깨지면 배포도 나가지 않는다.
+- 단계: `npm ci` → `npm test`(264개) → `npm run build` → `upload-pages-artifact` → `deploy-pages`. 테스트가 깨지면 배포도 나가지 않는다.
 - 빌드 단계가 `VITE_BASE_PATH=/damon-chat-desk/`를 넘긴다. 이 값이 없으면 asset이 `/assets/…`로 나가 프로젝트 페이지에서 404가 된다.
 - 산출물은 `dist/` 정적 파일뿐이고, 중간 서버도 서버 비용도 없다.
 
@@ -135,6 +206,14 @@ VITE_BASE_PATH=/damon-chat-desk/ npm run preview   # http://127.0.0.1:4173/damon
 ```
 
 수동 배포가 필요하면 `workflow_dispatch`로 같은 워크플로를 한 번 돌리면 된다(`dist/`를 직접 올릴 일은 없다).
+
+### 테스트 CI (PR)
+
+`deploy.yml`은 `main` 푸시에서만 돈다. PR 단계에서 타입체크·테스트·빌드를 먼저 막으려면
+[`docs/ci.workflow.yml`](docs/ci.workflow.yml)을 `.github/workflows/ci.yml`로 한 번 옮기면 된다 —
+Node 22에서 `npm ci` → `npx tsc --noEmit` → `npm test` → `npm run build` →
+`VITE_BASE_PATH=/damon-chat-desk/ npm run build`를 돌린다. 옮기는 방법과 각 단계의 의미는
+[`docs/ci-setup.md`](docs/ci-setup.md)에 있다.
 
 `.github/workflows/` 경로는 푸시 주체에 `workflows` 스코프가 없으면 거부된다. 워크플로를 고칠 때는 그
 권한이 있는 계정이나 웹 에디터를 쓴다. `docs/deploy.workflow.yml`은 같은 파일의 참고용 사본이다.

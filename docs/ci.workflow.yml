@@ -1,0 +1,61 @@
+# 테스트 CI 워크플로.
+#
+# 이 파일은 `.github/workflows/ci.yml`로 옮겨야 동작한다.
+# (커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로는 푸시할 수
+#  없다 — 웹 에디터에서 복사해 넣거나, workflows 스코프가 있는 토큰으로 한 번
+#  올리면 그 뒤로는 이 파일이 원본이다. docs/ci-setup.md 참고.)
+#
+# 무엇을 보는가:
+#   typecheck  npx tsc --noEmit          — 앱과 테스트의 타입
+#   test       npm test                  — vitest (전 시나리오)
+#   build      npm run build             — 기본 base(/)
+#   build:pages VITE_BASE_PATH=…         — GitHub Pages 프로젝트 페이지 빌드
+#
+# 배포(deploy.yml)는 main 푸시에서 같은 검사를 다시 돈다. 이 워크플로는
+# PR에서 먼저 막는 용도다 — 머지 전에 빨간불을 보기 위한 것.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # Pages는 프로젝트 페이지(/damon-chat-desk/)에서 서빙된다. base가
+      # 빠지면 asset이 /assets/…로 나가 404가 되므로 배포와 같은 값으로
+      # 한 번 더 빌드해 본다.
+      - name: Build (GitHub Pages base)
+        env:
+          VITE_BASE_PATH: /damon-chat-desk/
+        run: npm run build

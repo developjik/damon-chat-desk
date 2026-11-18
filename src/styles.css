@@ -3558,6 +3558,63 @@ a {
   background: var(--surface-2);
 }
 
+.wire-caret {
+  flex: none;
+  width: 8px;
+  font-size: 8px;
+  color: var(--text-faint);
+}
+
+/* A folded run of text deltas — one row instead of a hundred. */
+.wire-row.group {
+  border-left: 2px solid rgba(124, 140, 248, 0.5);
+  padding-left: 8px;
+  background: rgba(124, 140, 248, 0.06);
+}
+
+.wire-row.group:hover {
+  background: rgba(124, 140, 248, 0.12);
+}
+
+.wire-group.deltas.open .wire-row.group {
+  background: rgba(124, 140, 248, 0.12);
+}
+
+.wire-count {
+  flex: none;
+  padding: 0 4px;
+  font-size: 9px;
+  color: var(--accent);
+  border: 1px solid rgba(124, 140, 248, 0.35);
+  border-radius: 3px;
+}
+
+/* Opened deltas: indented under the fold header, dimmed so the run reads
+   as one block rather than as the head of the list. */
+.wire-deltas {
+  padding-left: 10px;
+  border-left: 1px solid var(--line);
+  margin-left: 10px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.wire-group.nested .wire-row {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  font-size: 9px;
+  opacity: 0.82;
+}
+
+.wire-group.nested .wire-time,
+.wire-group.nested .wire-dir,
+.wire-group.nested .wire-size {
+  font-size: 9px;
+}
+
+.wire-group.nested .wire-summary {
+  color: var(--text-faint);
+}
+
 .wire-time {
   flex: none;
   width: 62px;
@@ -3960,6 +4017,11 @@ a {
 
   .wire-dir {
     width: 32px;
+  }
+
+  .wire-deltas {
+    margin-left: 6px;
+    padding-left: 6px;
   }
 
   .wire-body {

@@ -2,12 +2,16 @@ import { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from
 import { copyText } from '../lib/download';
 import {
   INSPECTOR_FILTERS,
+  deltaGroupStats,
+  deltaGroupSummary,
   frameBody,
   frameDetail,
   frameMatches,
   frameSummary,
   formatBytes,
   formatLatency,
+  formatSpan,
+  inspectorRows,
   stamp,
   type InspectorFilter,
   type WireFrame,
@@ -34,11 +38,22 @@ function errorFrame(frame: WireFrame): boolean {
  * One wire row: time, direction, method, the event under it, the round
  * trip when it was a response, and its size. Clicking opens the payload.
  */
-function WireRow({ frame, open, onToggle }: { frame: WireFrame; open: boolean; onToggle: () => void }) {
+function WireRow({
+  frame,
+  open,
+  onToggle,
+  nested,
+}: {
+  frame: WireFrame;
+  open: boolean;
+  onToggle: () => void;
+  /** A delta inside an opened group — indented under its fold header. */
+  nested?: boolean;
+}) {
   const detail = frameDetail(frame);
   const summary = frameSummary(frame);
   return (
-    <div className={`wire-group ${open ? 'open' : ''}`}>
+    <div className={['wire-group', open ? 'open' : '', nested ? 'nested' : ''].filter(Boolean).join(' ')}>
       <button
         type="button"
         className={`wire-row ${frame.dir} ${errorFrame(frame) ? 'err' : ''}`}
@@ -51,13 +66,77 @@ function WireRow({ frame, open, onToggle }: { frame: WireFrame; open: boolean; o
         <span className="wire-method mono">
           {frame.method}
           {frame.id !== undefined ? <span className="wire-id"> #{frame.id}</span> : null}
-          {detail && detail !== 'request' && detail !== 'result' ? <span className="wire-sub mono">{detail}</span> : null}
+          {/* A delta's detail is always the same `timeline.assistant_message`
+              — inside a fold it only steals width from the text preview. */}
+          {detail && detail !== 'request' && detail !== 'result' && !nested ? <span className="wire-sub mono">{detail}</span> : null}
         </span>
         <span className="wire-lat mono">{formatLatency(frame.latencyMs)}</span>
         <span className="wire-size mono">{formatBytes(frame.bytes)}</span>
         <span className="wire-summary mono">{summary}</span>
       </button>
       {open ? <pre className="wire-body mono">{frameBody(frame)}</pre> : null}
+    </div>
+  );
+}
+
+/**
+ * A run of streamed text deltas, folded into one row.
+ *
+ * `← RX session.event ×98 deltas  2.4s  11.8KB` — the count, the wall
+ * time it took and the bytes it carried, with the opening words of the
+ * text as the preview. Clicking opens the individual frames, each of
+ * which still opens its own payload.
+ */
+export function DeltaGroupRow({
+  frames,
+  open,
+  onToggle,
+  selected,
+  onSelect,
+}: {
+  frames: WireFrame[];
+  open: boolean;
+  onToggle: () => void;
+  selected: number | null;
+  onSelect: (seq: number) => void;
+}) {
+  const stats = deltaGroupStats(frames);
+  return (
+    <div className={`wire-group deltas ${open ? 'open' : ''}`}>
+      <button
+        type="button"
+        className="wire-row rx group"
+        onClick={onToggle}
+        aria-expanded={open}
+        title={`${stats.count}개 텍스트 델타 — 눌러서 프레임 펼치기`}
+        aria-label={`${deltaGroupSummary(frames)} — 눌러서 프레임 펼치기`}
+      >
+        <span className="wire-caret mono" aria-hidden>
+          {open ? '▾' : '▸'}
+        </span>
+        <span className="wire-time mono">{stamp(stats.startedAt)}</span>
+        <span className="wire-dir mono rx">← RX</span>
+        <span className="wire-method mono">
+          session.event
+          <span className="wire-count mono">×{stats.count} deltas</span>
+        </span>
+        <span className="wire-lat mono">{formatSpan(stats.spanMs)}</span>
+        <span className="wire-size mono">{formatBytes(stats.bytes)}</span>
+        <span className="wire-summary mono">{stats.preview}</span>
+      </button>
+      {open ? (
+        <div className="wire-deltas">
+          {frames.map((frame) => (
+            <WireRow
+              key={frame.seq}
+              frame={frame}
+              nested
+              open={selected === frame.seq}
+              onToggle={() => onSelect(frame.seq)}
+            />
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -73,9 +152,13 @@ export function Inspector({ tap, open, filter, protocol, onFilter, onClose, onCl
   const snapshot = useSyncExternalStore(tap.subscribe, tap.getSnapshot, tap.getSnapshot);
   const [selected, setSelected] = useState<number | null>(null);
   const [follow, setFollow] = useState(true);
+  /** Fold consecutive text deltas — on by default, off restores one row each. */
+  const [group, setGroup] = useState(true);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
   const list = useRef<HTMLDivElement | null>(null);
 
   const rows = useMemo(() => snapshot.frames.filter((frame) => frameMatches(filter, frame)), [snapshot, filter]);
+  const items = useMemo(() => inspectorRows(rows, { group }), [rows, group]);
   const counts = useMemo(() => {
     let tools = 0;
     for (const frame of snapshot.frames) if (frame.tool) tools += 1;
@@ -86,7 +169,10 @@ export function Inspector({ tap, open, filter, protocol, onFilter, onClose, onCl
     const node = list.current;
     if (!node || !follow) return;
     node.scrollTop = node.scrollHeight;
-  }, [rows.length, follow]);
+    // `follow` pins to the newest frame as it lands. Folded deltas grow a
+    // row instead of adding one, so the trigger is the frame count, not
+    // the number of rows.
+  }, [snapshot.frames.length, follow, openGroup]);
 
   if (!open) return null;
 
@@ -150,18 +236,41 @@ export function Inspector({ tap, open, filter, protocol, onFilter, onClose, onCl
             </p>
           </div>
         ) : (
-          rows.map((frame) => (
-            <WireRow
-              key={frame.seq}
-              frame={frame}
-              open={selected === frame.seq}
-              onToggle={() => setSelected((current) => (current === frame.seq ? null : frame.seq))}
-            />
-          ))
+          items.map((row) =>
+            row.kind === 'group' ? (
+              <DeltaGroupRow
+                key={row.key}
+                frames={row.frames}
+                open={openGroup === row.key}
+                onToggle={() => {
+                  setOpenGroup((current) => (current === row.key ? null : row.key));
+                  setSelected(null);
+                }}
+                selected={selected}
+                onSelect={(seq) => setSelected((current) => (current === seq ? null : seq))}
+              />
+            ) : (
+              <WireRow
+                key={row.key}
+                frame={row.frame}
+                open={selected === row.frame.seq}
+                onToggle={() => setSelected((current) => (current === row.frame.seq ? null : row.frame.seq))}
+              />
+            ),
+          )
         )}
       </div>
 
       <footer className="inspector-foot">
+        <button
+          type="button"
+          className={`ghost-btn tiny ${group ? 'on' : ''}`}
+          onClick={() => setGroup((current) => !current)}
+          aria-pressed={group}
+          title="연속된 assistant_message 델타를 한 행으로 묶기"
+        >
+          group
+        </button>
         <button type="button" className="ghost-btn tiny" onClick={onClear}>
           clear
         </button>

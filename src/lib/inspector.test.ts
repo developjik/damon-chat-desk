@@ -1,14 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import {
   WireTap,
+  deltaGroupStats,
+  deltaGroupSummary,
+  deltaText,
+  foldedFrameCount,
   frameBody,
   frameDetail,
   frameMatches,
   frameSummary,
   formatBytes,
   formatLatency,
+  formatSpan,
+  inspectorRows,
+  isDeltaFrame,
   isToolTraffic,
   stamp,
+  type WireFrame,
 } from './inspector';
 
 const request = { id: 1, method: 'turn.start', params: { sessionId: 's-1', prompt: 'hello' } };
@@ -141,5 +149,114 @@ describe('frame helpers', () => {
     expect(formatLatency(2380)).toBe('2.38s');
     expect(formatBytes(512)).toBe('512B');
     expect(formatBytes(2048)).toBe('2.0KB');
+  });
+});
+
+describe('delta grouping', () => {
+  const prompt = { id: 1, method: 'turn.start', params: { sessionId: 's-1', prompt: 'go' } };
+
+  /** A tap whose clock ticks 10ms per frame, so spans are predictable. */
+  function stream(): WireTap {
+    return new WireTap(400, { now: (() => {
+      let clock = 1_700_000_000_000;
+      return () => (clock += 10);
+    })() });
+  }
+
+  function text(wire: WireTap, value: string): void {
+    wire.record({
+      dir: 'rx',
+      kind: 'notification',
+      method: 'session.event',
+      protocol: 'jsonrpc',
+      payload: { event: 'session.event', sessionId: 's-1', data: { type: 'timeline', kind: 'assistant_message', text: value } },
+    });
+  }
+
+  function toolCall(wire: WireTap): void {
+    wire.record({ dir: 'rx', kind: 'notification', method: 'session.event', protocol: 'jsonrpc', payload: event });
+  }
+
+  function run(): WireFrame[] {
+    const wire = stream();
+    wire.record({ dir: 'tx', kind: 'request', method: 'turn.start', protocol: 'jsonrpc', id: 1, payload: prompt });
+    text(wire, '첫 ');
+    text(wire, '문장');
+    text(wire, '을 ');
+    text(wire, '씁');
+    text(wire, '니다');
+    toolCall(wire);
+    text(wire, '그 ');
+    text(wire, '다음');
+    wire.record({ dir: 'rx', kind: 'result', method: 'turn.start', protocol: 'jsonrpc', id: 1, latencyMs: 900, payload: { id: 1, result: { turnId: 't-1' } } });
+    return [...wire.getSnapshot().frames];
+  }
+
+  it('folds a run of text deltas and splits it at the first other frame', () => {
+    const frames = run();
+    const rows = inspectorRows(frames);
+    expect(rows.map((row) => row.kind)).toEqual(['frame', 'group', 'frame', 'group', 'frame']);
+    const first = rows[1];
+    if (first.kind !== 'group') throw new Error('expected a group');
+    expect(first.frames.map((frame) => deltaText(frame)).join('')).toBe('첫 문장을 씁니다');
+    const second = rows[3];
+    if (second.kind !== 'group') throw new Error('expected a group');
+    expect(second.frames).toHaveLength(2);
+    // nothing is lost: every frame is either a row or inside one
+    expect(foldedFrameCount(rows) + rows.filter((row) => row.kind === 'frame').length).toBe(frames.length);
+  });
+
+  it('leaves a lone delta as its own row', () => {
+    const wire = stream();
+    text(wire, '한 글자');
+    toolCall(wire);
+    const rows = inspectorRows([...wire.getSnapshot().frames]);
+    expect(rows.map((row) => row.kind)).toEqual(['frame', 'frame']);
+  });
+
+  it('folds the frames the filter shows, not the ones it hides', () => {
+    const frames = run();
+    const rxRows = inspectorRows(frames.filter((frame) => frameMatches('rx', frame)));
+    expect(rxRows.map((row) => row.kind)).toEqual(['group', 'frame', 'group', 'frame']);
+    const toolRows = inspectorRows(frames.filter((frame) => frameMatches('tools', frame)));
+    expect(toolRows.map((row) => row.kind)).toEqual(['frame']);
+  });
+
+  it('can be turned off, one row per frame', () => {
+    const frames = run();
+    const rows = inspectorRows(frames, { group: false });
+    expect(rows).toHaveLength(frames.length);
+    expect(rows.every((row) => row.kind === 'frame')).toBe(true);
+  });
+
+  it('reads out count, span and size of the folded run', () => {
+    const frames = run();
+    const first = frames.filter((frame) => isDeltaFrame(frame)).slice(0, 5);
+    const stats = deltaGroupStats(first);
+    expect(stats.count).toBe(5);
+    expect(stats.spanMs).toBe(40);
+    expect(stats.bytes).toBe(first.reduce((sum, frame) => sum + frame.bytes, 0));
+    expect(stats.chars).toBe('첫 문장을 씁니다'.length);
+    expect(stats.preview).toBe('첫 문장을 씁니다');
+    expect(deltaGroupSummary(first)).toBe(`×5 deltas · 40ms · ${formatBytes(stats.bytes)}`);
+  });
+
+  it('knows exactly what counts as a text delta', () => {
+    const wire = stream();
+    wire.record({ dir: 'rx', kind: 'notification', method: 'session.event', protocol: 'jsonrpc', payload: { event: 'session.event', data: { type: 'timeline', kind: 'assistant_message', text: 'a' } } });
+    wire.record({ dir: 'rx', kind: 'notification', method: 'session.event', protocol: 'jsonrpc', payload: { event: 'session.event', data: { type: 'timeline', kind: 'assistant_message', text: 'b' } } });
+    toolCall(wire);
+    wire.record({ dir: 'rx', kind: 'notification', method: 'session.event', protocol: 'jsonrpc', payload: { event: 'session.event', data: { type: 'permission_requested', kind: 'tool' } } });
+    const frames = [...wire.getSnapshot().frames];
+    expect(frames.map((frame) => isDeltaFrame(frame))).toEqual([true, true, false, false]);
+    expect(isDeltaFrame({ dir: 'tx', kind: 'request', method: 'session.event', protocol: 'jsonrpc', payload: {} })).toBe(false);
+    expect(isDeltaFrame({ dir: 'rx', kind: 'notification', method: 'turn.start', protocol: 'jsonrpc', payload: {} })).toBe(false);
+  });
+
+  it('formats a span in the units a reader expects', () => {
+    expect(formatSpan(0)).toBe('0ms');
+    expect(formatSpan(840)).toBe('840ms');
+    expect(formatSpan(2400)).toBe('2.4s');
+    expect(formatSpan(65_000)).toBe('1m05s');
   });
 });
