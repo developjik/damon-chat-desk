@@ -110,6 +110,35 @@ export function isToolTraffic(frame: WireDraft): boolean {
   );
 }
 
+function payloadData(frame: WireFrame | WireDraft): Record<string, unknown> | null {
+  if (frame.method !== 'session.event') return null;
+  const data = (frame.payload as { data?: unknown } | undefined)?.data;
+  return data && typeof data === 'object' ? (data as Record<string, unknown>) : null;
+}
+
+/**
+ * A streamed text delta: `session.event` / `timeline.assistant_message`.
+ *
+ * These arrive per token — a demo turn emits one frame every few
+ * characters — and 100+ of them in a row would bury the frames a reader
+ * is actually looking for (`tool_call`, `permission_requested`,
+ * `plan.respond`, `turn.steer`, `turn.cancel`).
+ */
+export function isDeltaFrame(frame: WireFrame | WireDraft): boolean {
+  if (frame.dir !== 'rx') return false;
+  const data = payloadData(frame);
+  if (!data) return false;
+  if (typeof data.type === 'string' && data.type && data.type !== 'timeline') return false;
+  return data.kind === 'assistant_message';
+}
+
+/** The text a delta frame carries, when it carries one. */
+export function deltaText(frame: WireFrame | WireDraft): string {
+  const data = payloadData(frame);
+  const text = data?.text;
+  return typeof text === 'string' ? text : '';
+}
+
 function bytesOf(payload: unknown): number {
   try {
     const json = JSON.stringify(payload);
@@ -253,6 +282,104 @@ export class WireTap {
   }
 }
 
+/**
+ * One row in the inspector list: a single frame, or a run of consecutive
+ * text deltas folded into one row.
+ *
+ * Rows are built from the frames that pass the active filter — the list a
+ * reader sees is what gets folded, so a frame the filter hides never
+ * splits a run it is not part of.
+ */
+export type InspectorRow =
+  | { kind: 'frame'; key: string; frame: WireFrame }
+  | { kind: 'group'; key: string; frames: WireFrame[] };
+
+export interface DeltaGroupStats {
+  count: number;
+  startedAt: number;
+  endedAt: number;
+  spanMs: number;
+  bytes: number;
+  chars: number;
+  /** The group's text, ready for a one-line preview. */
+  preview: string;
+  /** Full text of the run — what a reader sees when it is expanded. */
+  text: string;
+}
+
+function frameRow(frame: WireFrame): InspectorRow {
+  return { kind: 'frame', key: `f-${frame.seq}`, frame };
+}
+
+/** Count, span, size and text of a folded delta run. */
+export function deltaGroupStats(frames: readonly WireFrame[], previewChars = 110): DeltaGroupStats {
+  const first = frames[0];
+  const last = frames[frames.length - 1];
+  let bytes = 0;
+  let text = '';
+  for (const frame of frames) {
+    bytes += frame.bytes;
+    text += deltaText(frame);
+  }
+  return {
+    count: frames.length,
+    startedAt: first?.at ?? 0,
+    endedAt: last?.at ?? 0,
+    spanMs: first && last ? Math.max(0, last.at - first.at) : 0,
+    bytes,
+    chars: text.length,
+    preview: shortJson(text.replace(/\s+/g, ' ').trim(), previewChars),
+    text,
+  };
+}
+
+/** `×98 deltas · 2.4s · 11.8KB` — the folded row's own readout. */
+export function deltaGroupSummary(frames: readonly WireFrame[]): string {
+  const stats = deltaGroupStats(frames);
+  return `×${stats.count} deltas · ${formatSpan(stats.spanMs)} · ${formatBytes(stats.bytes)}`;
+}
+
+/**
+ * Fold consecutive text deltas into one row.
+ *
+ * A run is broken by any other frame — a `tool_call`, a
+ * `permission_requested`, a request — so each stretch of prose between
+ * events keeps its own row. Runs shorter than `min` stay as plain frames:
+ * one delta under a fold header hides more than it saves.
+ */
+export function inspectorRows(
+  frames: readonly WireFrame[],
+  options: { group?: boolean; min?: number } = {},
+): InspectorRow[] {
+  if (options.group === false) return frames.map(frameRow);
+  const min = Math.max(2, options.min ?? 2);
+  const rows: InspectorRow[] = [];
+  let run: WireFrame[] = [];
+  const flush = () => {
+    if (run.length === 0) return;
+    if (run.length >= min) rows.push({ kind: 'group', key: `g-${run[0].seq}`, frames: run });
+    else for (const frame of run) rows.push(frameRow(frame));
+    run = [];
+  };
+  for (const frame of frames) {
+    if (isDeltaFrame(frame)) {
+      run.push(frame);
+      continue;
+    }
+    flush();
+    rows.push(frameRow(frame));
+  }
+  flush();
+  return rows;
+}
+
+/** How many frames a row list hides inside folded groups. */
+export function foldedFrameCount(rows: readonly InspectorRow[]): number {
+  let folded = 0;
+  for (const row of rows) if (row.kind === 'group') folded += row.frames.length;
+  return folded;
+}
+
 export function frameMatches(filter: InspectorFilter, frame: WireFrame | WireDraft): boolean {
   switch (filter) {
     case 'tx':
@@ -282,6 +409,16 @@ export function formatLatency(ms: number | undefined): string {
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   return `${(bytes / 1024).toFixed(1)}KB`;
+}
+
+/** A span between two frames — `840ms`, `2.4s`, `1m05s`. */
+export function formatSpan(ms: number): string {
+  const value = Math.max(0, ms);
+  if (value < 1000) return `${Math.round(value)}ms`;
+  if (value < 60_000) return `${(value / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1000);
+  return `${minutes}m${String(seconds).padStart(2, '0')}s`;
 }
 
 /** The event / payload name under the method — `timeline.tool_call`. */
