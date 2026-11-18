@@ -209,14 +209,17 @@ VITE_BASE_PATH=/damon-chat-desk/ npm run preview   # http://127.0.0.1:4173/damon
 
 ### 테스트 CI (PR)
 
-`deploy.yml`은 `main` 푸시에서만 돈다. PR 단계에서 타입체크·테스트·빌드를 먼저 막으려면
-[`docs/ci.workflow.yml`](docs/ci.workflow.yml)을 `.github/workflows/ci.yml`로 한 번 옮기면 된다 —
-Node 22에서 `npm ci` → `npx tsc --noEmit` → `npm test` → `npm run build` →
-`VITE_BASE_PATH=/damon-chat-desk/ npm run build`를 돌린다. 옮기는 방법과 각 단계의 의미는
-[`docs/ci-setup.md`](docs/ci-setup.md)에 있다.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)이 PR 단계에서 먼저 막는다. Node 22에서
+`npm ci` → `npx tsc --noEmit` → `npm test` → `npm run build` →
+`VITE_BASE_PATH=/damon-chat-desk/ npm run build`를 돌려, `deploy.yml`이 `main` 푸시에서 다시 돌릴
+검사를 머지 전에 본다. 트리거는 `pull_request`·`push`(main)·`workflow_dispatch`이고, 같은 브랜치에
+새 커밋이 오면 이전 실행은 취소된다. 각 단계의 의미는 [`docs/ci-setup.md`](docs/ci-setup.md)에 있다.
 
-`.github/workflows/` 경로는 푸시 주체에 `workflows` 스코프가 없으면 거부된다. 워크플로를 고칠 때는 그
-권한이 있는 계정이나 웹 에디터를 쓴다. `docs/deploy.workflow.yml`은 같은 파일의 참고용 사본이다.
+워크플로 사본은 `docs/`에 둔다 — [`docs/ci.workflow.yml`](docs/ci.workflow.yml)은 `ci.yml`의,
+[`docs/deploy.workflow.yml`](docs/deploy.workflow.yml)은 `deploy.yml`의 참고용 사본이다(실제로 도는 파일은
+`.github/workflows/` 아래이고, 고칠 때는 원본과 사본을 같이 고친다). `.github/workflows/` 경로는 푸시
+주체에 `workflows` 스코프가 없으면 거부되므로, 이 두 워크플로도 웹 에디터로 올렸고 이후 수정도 그
+권한이 있는 계정이나 웹 에디터로 한다.
 
 ## 검증 도구
 
