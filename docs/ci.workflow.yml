@@ -1,9 +1,10 @@
-# 테스트 CI 워크플로.
+# 테스트 CI 워크플로 — 참고용 사본.
 #
-# 이 파일은 `.github/workflows/ci.yml`로 옮겨야 동작한다.
-# (커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로는 푸시할 수
-#  없다 — 웹 에디터에서 복사해 넣거나, workflows 스코프가 있는 토큰으로 한 번
-#  올리면 그 뒤로는 이 파일이 원본이다. docs/ci-setup.md 참고.)
+# 실제로 도는 파일은 `.github/workflows/ci.yml`이다(활성 상태, Actions 탭의 `ci`).
+# PR·main 푸시·수동 실행에서 typecheck·테스트·빌드를 돌려 머지 전에 빨간불을 본다.
+# 이 사본은 문서에서 바로 읽어 보라고 둔 것이며 복사해서 쓰는 파일이 아니다 —
+# 고칠 때는 두 파일을 같이 고친다. `.github/workflows/` 경로는 workflows 스코프가
+# 없으면 푸시가 거부되므로 수정은 웹 에디터로 한다. docs/ci-setup.md 참고.
 #
 # 무엇을 보는가:
 #   typecheck  npx tsc --noEmit          — 앱과 테스트의 타입
