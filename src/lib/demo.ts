@@ -12,6 +12,91 @@ import type { MemoryEntry, MemoryScope, PlanDecision, PlanRequest, ReplySlot, Ro
 import { makeTarget } from './targets';
 import { buildPlan } from './plan';
 import { MemoryRejection, memoryStats } from './memory';
+import type { WireTap } from './inspector';
+import { scenarioById, type Scenario, type ScenarioBeat, type ScenarioId } from './scenarios';
+
+/**
+ * The simulated daemon's own wire log.
+ *
+ * A demo turn is a real protocol exchange with a fake peer: this writes
+ * the same envelopes the daemon sends (`{id, method, params}`, `{id,
+ * result}`, `{event, sessionId, data}`) into the inspector's tap, so what
+ * a visitor reads in the panel matches what a live daemon would put on
+ * the socket — `turn.start`, `session.event` pushes, `plan.respond`.
+ */
+class DemoWire {
+  private nextId = 1;
+  private sent = new Map<number, { method: string; at: number }>();
+
+  constructor(
+    private readonly tap: WireTap | null,
+    private readonly now: () => number,
+  ) {}
+
+  request(method: string, params: Record<string, unknown>, sessionId?: string): number {
+    const id = this.nextId++;
+    const at = this.now();
+    this.sent.set(id, { method, at });
+    this.tap?.record({
+      dir: 'tx',
+      kind: 'request',
+      method,
+      protocol: 'jsonrpc',
+      id,
+      sessionId,
+      at,
+      payload: { id, method, params },
+    });
+    return id;
+  }
+
+  result(id: number, result: unknown): void {
+    const sent = this.sent.get(id);
+    this.sent.delete(id);
+    this.tap?.record({
+      dir: 'rx',
+      kind: 'result',
+      method: sent?.method ?? 'response',
+      protocol: 'jsonrpc',
+      id,
+      latencyMs: sent ? this.now() - sent.at : undefined,
+      status: 'ok',
+      payload: { id, result },
+    });
+  }
+
+  /** One server push — `session.event` in every case the daemon uses. */
+  push(event: string, data: Record<string, unknown>, sessionId?: string): void {
+    this.tap?.record({
+      dir: 'rx',
+      kind: 'notification',
+      method: event,
+      protocol: 'jsonrpc',
+      sessionId,
+      payload: { event, sessionId, data },
+    });
+  }
+}
+
+/** A scripted call in the wire's own `ToolCallDetail` shape. */
+function detailOf(script: { kind: ToolCall['kind']; input: string; result: ToolResult }): Record<string, unknown> {
+  switch (script.kind) {
+    case 'shell':
+      return { type: 'shell', command: script.input, output: script.result.stdout, exit_code: script.result.exitCode };
+    case 'read':
+      return { type: 'read', path: script.input, content: script.result.stdout };
+    case 'edit':
+      return { type: 'edit', path: script.input, unified_diff: script.result.diff };
+    case 'write':
+      return { type: 'write', path: script.input, content: script.result.stdout };
+    case 'search':
+      return { type: 'search', query: script.input, content: script.result.stdout };
+    case 'fetch':
+      return { type: 'fetch', url: script.input, result: script.result.stdout };
+    default:
+      return { type: 'unknown', input: script.input };
+  }
+}
 
 interface DemoProfile {
   provider: string;
@@ -269,7 +354,8 @@ export function composeReply(prompt: string, target: RouteTarget): string {
 /* ------------------------------------------------------------------ */
 
 interface DemoToolScript {
-  name: string;
+  /** Backend-specific tool name; falls back to the kind for scenarios. */
+  name?: string;
   kind: ToolCall['kind'];
   label: string;
   input: string;
@@ -281,10 +367,10 @@ interface DemoToolScript {
 
 /** Per-backend tool vocabulary, so a demo log matches the provider. */
 const TOOL_NAMES: Record<string, Partial<Record<ToolCall['kind'], string>>> = {
-  claude: { shell: 'Bash', read: 'Read', edit: 'Edit', search: 'Grep' },
-  codex: { shell: 'shell', read: 'read', edit: 'apply_patch', search: 'search' },
-  qwen: { shell: 'bash', read: 'read_file', edit: 'edit_file', search: 'grep' },
-  opencode: { shell: 'bash', read: 'read', edit: 'edit', search: 'grep' },
+  claude: { shell: 'Bash', read: 'Read', edit: 'Edit', write: 'Write', search: 'Grep', fetch: 'WebFetch' },
+  codex: { shell: 'shell', read: 'read', edit: 'apply_patch', write: 'write', search: 'search', fetch: 'fetch' },
+  qwen: { shell: 'bash', read: 'read_file', edit: 'edit_file', write: 'write_file', search: 'grep', fetch: 'fetch' },
+  opencode: { shell: 'bash', read: 'read', edit: 'edit', write: 'write', search: 'grep', fetch: 'fetch' },
 };
 
 function toolName(target: RouteTarget, kind: ToolCall['kind']): string {
@@ -360,7 +446,7 @@ function scriptCall(
 ): ToolCall {
   return {
     id,
-    name: script.name,
+    name: script.name ?? script.kind,
     kind: script.kind,
     label: script.label,
     input: script.input,
@@ -378,10 +464,29 @@ async function* runDemoTool(
   now: () => number,
   sleep: (ms: number) => Promise<void>,
   waitMs: number,
+  wire?: { wire: DemoWire; sessionId?: string },
 ): AsyncGenerator<StreamEvent> {
   const startedAt = now();
+  const name = script.name ?? script.kind;
+  wire?.wire.push(
+    'session.event',
+    { type: 'timeline', kind: 'tool_call', call_id: id, name, status: 'running', detail: detailOf(script) },
+    wire.sessionId,
+  );
   yield { type: 'tool', call: scriptCall(script, id, startedAt, 'running') };
   await sleep(waitMs);
+  wire?.wire.push(
+    'session.event',
+    {
+      type: 'timeline',
+      kind: 'tool_call',
+      call_id: id,
+      name,
+      status: script.status === 'error' ? 'failed' : 'completed',
+      detail: detailOf(script),
+    },
+    wire.sessionId,
+  );
   yield { type: 'tool', call: scriptCall(script, id, startedAt, script.status, startedAt + script.ms) };
 }
 
@@ -518,6 +623,19 @@ export interface DemoDeps {
   random?: () => number;
 }
 
+/** What the desk may ask a simulated turn for. */
+export interface DemoStreamOptions {
+  signal?: AbortSignal;
+  composeFrom?: string;
+  steerKey?: string;
+  /** The conversation that owns this turn — the frame's `sessionId`. */
+  sessionId?: string;
+  /** First turn of a conversation: the wire shows `session.create` first. */
+  newSession?: boolean;
+  /** Play one of the real-work scenarios instead of composing an answer. */
+  scenario?: ScenarioId;
+}
+
 export interface DemoSession {
   sessionId: string;
   backend: string;
@@ -533,6 +651,8 @@ export class DemoTransport {
   private readonly deps: Required<DemoDeps>;
   private sessions: DemoSession[] = [];
   private memoryEntries: MemoryEntry[];
+  /** Where the simulated wire is recorded (the inspector). */
+  private tap: WireTap | null = null;
 
   constructor(deps: DemoDeps = {}) {
     this.deps = {
@@ -581,6 +701,15 @@ export class DemoTransport {
   hydrateMemory(entries: MemoryEntry[]): void {
     if (!Array.isArray(entries) || entries.length === 0) return;
     this.memoryEntries = entries.map((entry) => ({ ...entry }));
+  }
+
+  /** Attach the inspector's tap; the desk owns it and passes it in. */
+  setTap(tap: WireTap | null): void {
+    this.tap = tap;
+  }
+
+  private wire(): DemoWire {
+    return new DemoWire(this.tap, this.deps.now);
   }
 
   /** seed a conversation list so a first visit is not an empty shell */
@@ -722,12 +851,15 @@ export class DemoTransport {
   private steers = new Map<string, Array<{ text: string; at: number }>>();
 
   /** Queue a steering instruction for the turn running on `key`. */
-  steer(text: string, key = '*'): void {
+  steer(text: string, key = '*', sessionId?: string): void {
     const body = text.trim();
     if (!body) return;
     const queued = this.steers.get(key) ?? [];
     queued.push({ text: body, at: this.deps.now() });
     this.steers.set(key, queued);
+    const wire = this.wire();
+    const id = wire.request('turn.steer', { sessionId: sessionId ?? key, prompt: body }, sessionId);
+    wire.result(id, { result: 'queued for the running turn' });
   }
 
   /** Steers waiting for a turn; the stream drains them between chunks. */
@@ -747,6 +879,8 @@ export class DemoTransport {
   forkSession(sessionId?: string, title?: string): string {
     this.forkCount += 1;
     const id = `demo-fork-${this.forkCount}`;
+    const wire = this.wire();
+    const requestId = wire.request('session.fork', { sessionId: sessionId ?? '', upto: undefined }, sessionId);
     const source = this.sessions.find((row) => row.sessionId === sessionId);
     this.addSession({
       sessionId: id,
@@ -754,6 +888,7 @@ export class DemoTransport {
       title: `${title ?? source?.title ?? '새 대화'} (fork)`,
       createdAt: this.deps.now(),
     });
+    wire.result(requestId, { sessionId: id });
     return id;
   }
 
@@ -762,6 +897,15 @@ export class DemoTransport {
   /* ---------------------------------------------------------------- */
 
   private plans: Array<{ planId: string; revision: number; status: string }> = [];
+  /** Plan id → the beats the agent runs once that plan is approved. */
+  private resumes = new Map<string, ScenarioBeat[]>();
+
+  /** What an approved plan continues with, or nothing when it has no follow-up. */
+  takeResume(planId: string): ScenarioBeat[] | undefined {
+    const beats = this.resumes.get(planId);
+    this.resumes.delete(planId);
+    return beats;
+  }
 
   async respondPlan(input: {
     planId: string;
@@ -769,6 +913,13 @@ export class DemoTransport {
     decision: PlanDecision;
     feedback?: string;
   }): Promise<{ status: string; applied: boolean; revision: number }> {
+    const wire = this.wire();
+    const requestId = wire.request('plan.respond', {
+      planId: input.planId,
+      expectedRevision: input.revision ?? 1,
+      decision: input.decision,
+      ...(input.feedback ? { feedback: input.feedback } : {}),
+    });
     await this.deps.sleep(140);
     const status =
       input.decision === 'approve' ? 'approved' : input.decision === 'request_changes' ? 'changes_requested' : 'deferred';
@@ -776,14 +927,76 @@ export class DemoTransport {
     const existing = this.plans.find((row) => row.planId === input.planId);
     if (existing) existing.status = status;
     else this.plans.push({ planId: input.planId, revision, status });
-    return { status, applied: input.decision !== 'defer', revision: input.decision === 'request_changes' ? revision + 1 : revision };
+    const applied = input.decision !== 'defer';
+    const nextRevision = input.decision === 'request_changes' ? revision + 1 : revision;
+    wire.result(requestId, {
+      recorded: true,
+      status,
+      applied,
+      planId: input.planId,
+      revision: nextRevision,
+    });
+    return { status, applied, revision: nextRevision };
   }
 
   async *streamTurn(
     prompt: string,
     target: RouteTarget,
-    opts: { signal?: AbortSignal; composeFrom?: string; steerKey?: string } = {},
+    opts: DemoStreamOptions = {},
   ): AsyncGenerator<StreamEvent> {
+    const scenario = opts.scenario ? scenarioById(opts.scenario) : undefined;
+    if (scenario) {
+      yield* this.streamScenario(scenario, target, opts);
+      return;
+    }
+    yield* this.streamComposed(prompt, target, opts);
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* wire header — session.create (first turn) then turn.start          */
+  /* ---------------------------------------------------------------- */
+
+  private async openTurn(
+    wire: DemoWire,
+    target: RouteTarget,
+    sessionId: string,
+    prompt: string,
+    newSession: boolean,
+  ): Promise<number> {
+    if (newSession) {
+      const created = wire.request('session.create', { backend: target.provider, model: target.model || undefined }, sessionId);
+      await this.deps.sleep(24);
+      wire.result(created, { sessionId, backend: target.provider, replayed: 0 });
+    }
+    const turnId = wire.request('turn.start', { sessionId, prompt }, sessionId);
+    wire.push('session.event', { type: 'turn_started', turn_id: sessionId }, sessionId);
+    return turnId;
+  }
+
+  /** The client's `turn.cancel` and the daemon's acknowledgement. */
+  private cancelTurn(wire: DemoWire, sessionId: string): void {
+    const id = wire.request('turn.cancel', { sessionId }, sessionId);
+    wire.result(id, { cancelled: true });
+    wire.push('session.event', { type: 'turn_canceled', reason: 'user' }, sessionId);
+  }
+
+  private usageFrames(usage: { inputTokens: number; outputTokens: number; costUsd: number }) {
+    return {
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      cost_usd: Number(usage.costUsd.toFixed(6)),
+    };
+  }
+
+  private costOf(profile: DemoProfile, inputTokens: number, outputTokens: number): number {
+    return (inputTokens / 1000) * profile.price.input + (outputTokens / 1000) * profile.price.output;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* composed answer — the generic demo turn                            */
+  /* ---------------------------------------------------------------- */
+
+  private async *streamComposed(prompt: string, target: RouteTarget, opts: DemoStreamOptions): AsyncGenerator<StreamEvent> {
     const profile = profileFor(target);
     const { sleep, random } = this.deps;
     // `prompt` is what the desk actually sent (memory block included);
@@ -793,7 +1006,11 @@ export class DemoTransport {
     const text = composeReply(ask, target);
     const started = this.deps.now();
     const steerKey = opts.steerKey ?? target.key;
-    yield { type: 'start', turnId: `demo-${started.toString(36)}` };
+    const sessionId = opts.sessionId ?? `demo-${target.provider}-session`;
+    const wire = this.wire();
+    const turnKey = `demo-${started.toString(36)}`;
+    yield { type: 'start', turnId: turnKey };
+    const turnId = await this.openTurn(wire, target, sessionId, prompt, opts.newSession === true);
 
     const delay = (min: number, max: number) => min + Math.round(random() * (max - min));
     await sleep(delay(profile.firstToken[0], profile.firstToken[1]));
@@ -805,28 +1022,30 @@ export class DemoTransport {
     let nextTool = 0;
     let toolSeq = 0;
 
-    const runTool = (script: DemoToolScript): AsyncGenerator<StreamEvent> => {
-      toolSeq += 1;
-      const id = `demo-call-${toolSeq}-${started.toString(36)}`;
-      return runDemoTool(script, id, this.deps.now, sleep, delay(150, 280));
-    };
+    const runTool = (script: DemoToolScript, id: string) =>
+      runDemoTool(script, id, this.deps.now, sleep, delay(150, 280), { wire, sessionId });
 
     while (cursor < chunks.length) {
       if (opts.signal?.aborted) {
+        this.cancelTurn(wire, sessionId);
         yield { type: 'done', stopReason: 'canceled' };
         return;
       }
-      const steered = this.takeSteers(steerKey);
-      for (const note of steered) {
+      for (const note of this.takeSteers(steerKey)) {
         yield { type: 'steer', text: note.text, at: note.at };
-        yield { type: 'delta', text: `\n\n> ${note.text} — 반영해서 이어갑니다.\n\n` };
+        const echo = `\n\n> ${note.text} — 반영해서 이어갑니다.\n\n`;
+        yield { type: 'delta', text: echo };
+        wire.push('session.event', { type: 'timeline', kind: 'assistant_message', text: echo }, sessionId);
       }
-      yield { type: 'delta', text: chunks[cursor] };
+      const chunk = chunks[cursor];
       cursor += 1;
+      yield { type: 'delta', text: chunk };
+      wire.push('session.event', { type: 'timeline', kind: 'assistant_message', text: chunk }, sessionId);
       if (scripts.length > 0 && cursor % between === 0 && nextTool < scripts.length) {
         const script = scripts[nextTool];
         nextTool += 1;
-        yield* runTool(script);
+        toolSeq += 1;
+        yield* runTool(script, `demo-call-${toolSeq}-${started.toString(36)}`);
       }
       await sleep(delay(profile.pace[0], profile.pace[1]));
     }
@@ -835,27 +1054,200 @@ export class DemoTransport {
     while (nextTool < scripts.length) {
       const script = scripts[nextTool];
       nextTool += 1;
-      yield* runTool(script);
+      toolSeq += 1;
+      yield* runTool(script, `demo-call-${toolSeq}-${started.toString(36)}`);
     }
 
     const inputTokens = Math.max(12, Math.round(prompt.length / 3.6));
     const outputTokens = Math.max(24, Math.round(text.length / 3.2));
-    yield {
-      type: 'usage',
-      usage: {
-        inputTokens,
-        outputTokens,
-        costUsd: (inputTokens / 1000) * profile.price.input + (outputTokens / 1000) * profile.price.output,
-      },
-    };
+    const usage = { inputTokens, outputTokens, costUsd: this.costOf(profile, inputTokens, outputTokens) };
+    yield { type: 'usage', usage };
 
     if (intent === 'plan') {
       // A design ask parks a plan for approval — the card is the demo's
       // plan.respond surface, same as the daemon's `kind: plan` ask.
-      yield { type: 'plan', plan: demoPlan(ask, target) };
+      const plan = demoPlan(ask, target);
+      wire.push(
+        'session.event',
+        {
+          type: 'permission_requested',
+          id: plan.id,
+          kind: 'plan',
+          name: 'ExitPlanMode',
+          title: plan.title,
+          input: { plan: plan.content },
+          actions: [
+            { id: 'allow', label: 'approve', behavior: 'allow' },
+            { id: 'deny', label: 'request changes', behavior: 'deny' },
+          ],
+        },
+        sessionId,
+      );
+      wire.result(turnId, { turnId: turnKey, stopReason: 'awaiting_plan' });
+      yield { type: 'plan', plan };
       yield { type: 'done', stopReason: 'awaiting_plan' };
       return;
     }
+    wire.push('session.event', { type: 'turn_completed', usage: this.usageFrames(usage) }, sessionId);
+    wire.result(turnId, { turnId: turnKey, stopReason: 'completed', usage: this.usageFrames(usage) });
+    yield { type: 'done', stopReason: 'completed' };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* scripted scenarios — refactor · PR review · incident               */
+  /* ---------------------------------------------------------------- */
+
+  private scenarioPlan(scenario: Scenario): PlanRequest {
+    const content = scenario.plan?.content ?? '';
+    return buildPlan({
+      requestId: `perm-${scenario.id}-1`,
+      planId: `plan-demo-${scenario.id}`,
+      revision: 1,
+      content,
+      title: scenario.plan?.title,
+    });
+  }
+
+  /**
+   * Stream one beat list: prose in chunks, tools through `runDemoTool`,
+   * a steer echo whenever the user steers mid-run. Aborting sets
+   * `control.canceled` so the caller can close the turn's frames once.
+   */
+  private async *playBeats(
+    beats: ScenarioBeat[],
+    target: RouteTarget,
+    wire: DemoWire,
+    sessionId: string,
+    steerKey: string,
+    profile: DemoProfile,
+    opts: DemoStreamOptions,
+    control: { canceled: boolean },
+  ): AsyncGenerator<StreamEvent> {
+    const { sleep, random } = this.deps;
+    const delay = (min: number, max: number) => min + Math.round(random() * (max - min));
+    const stamp = Date.now().toString(36);
+    let toolSeq = 0;
+
+    for (const beat of beats) {
+      if (control.canceled) return;
+      if (beat.kind === 'tool') {
+        toolSeq += 1;
+        const name = beat.tool.name ?? toolName(target, beat.tool.kind);
+        yield* runDemoTool(
+          { ...beat.tool, name },
+          `demo-call-${toolSeq}-${stamp}`,
+          this.deps.now,
+          sleep,
+          delay(180, 340),
+          { wire, sessionId },
+        );
+        continue;
+      }
+      for (const chunk of chunkText(beat.text)) {
+        if (opts.signal?.aborted) {
+          control.canceled = true;
+          return;
+        }
+        for (const note of this.takeSteers(steerKey)) {
+          yield { type: 'steer', text: note.text, at: note.at };
+          const echo = `\n\n> ${note.text} — 반영해서 이어갑니다.\n\n`;
+          yield { type: 'delta', text: echo };
+          wire.push('session.event', { type: 'timeline', kind: 'assistant_message', text: echo }, sessionId);
+        }
+        yield { type: 'delta', text: chunk };
+        wire.push('session.event', { type: 'timeline', kind: 'assistant_message', text: chunk }, sessionId);
+        await sleep(delay(profile.pace[0], profile.pace[1]));
+      }
+    }
+  }
+
+  private async *streamScenario(
+    scenario: Scenario,
+    target: RouteTarget,
+    opts: DemoStreamOptions,
+  ): AsyncGenerator<StreamEvent> {
+    const profile = profileFor(target);
+    const steerKey = opts.steerKey ?? target.key;
+    const sessionId = opts.sessionId ?? `demo-${target.provider}-session`;
+    const wire = this.wire();
+    const started = this.deps.now();
+    const turnKey = `demo-${started.toString(36)}`;
+    yield { type: 'start', turnId: turnKey };
+    const turnId = await this.openTurn(wire, target, sessionId, scenario.prompt, opts.newSession === true);
+    await this.deps.sleep(profile.firstToken[0] + 120);
+
+    const control = { canceled: false };
+    yield* this.playBeats(scenario.beats, target, wire, sessionId, steerKey, profile, opts, control);
+    if (control.canceled) {
+      this.cancelTurn(wire, sessionId);
+      yield { type: 'done', stopReason: 'canceled' };
+      return;
+    }
+
+    const usage = { ...scenario.usage, costUsd: this.costOf(profile, scenario.usage.inputTokens, scenario.usage.outputTokens) };
+    yield { type: 'usage', usage };
+
+    if (scenario.plan) {
+      const plan = this.scenarioPlan(scenario);
+      wire.push(
+        'session.event',
+        {
+          type: 'permission_requested',
+          id: plan.id,
+          kind: 'plan',
+          name: 'ExitPlanMode',
+          title: plan.title,
+          input: { plan: plan.content },
+          actions: [
+            { id: 'allow', label: 'approve', behavior: 'allow' },
+            { id: 'deny', label: 'request changes', behavior: 'deny' },
+            { id: 'defer', label: 'defer', behavior: 'deny' },
+          ],
+        },
+        sessionId,
+      );
+      if (scenario.after?.length) this.resumes.set(plan.planId ?? plan.id, scenario.after);
+      wire.result(turnId, { turnId: turnKey, stopReason: 'awaiting_plan' });
+      yield { type: 'plan', plan };
+      yield { type: 'done', stopReason: 'awaiting_plan' };
+      return;
+    }
+
+    wire.push('session.event', { type: 'turn_completed', usage: this.usageFrames(usage) }, sessionId);
+    wire.result(turnId, { turnId: turnKey, stopReason: 'completed', usage: this.usageFrames(usage) });
+    yield { type: 'done', stopReason: 'completed' };
+  }
+
+  /** The turn an approved plan starts — a fresh `turn.start` on the wire. */
+  async *resumeBeats(
+    beats: ScenarioBeat[],
+    target: RouteTarget,
+    opts: { signal?: AbortSignal; sessionId?: string; prompt?: string } = {},
+  ): AsyncGenerator<StreamEvent> {
+    const profile = profileFor(target);
+    const sessionId = opts.sessionId ?? `demo-${target.provider}-session`;
+    const wire = this.wire();
+    const started = this.deps.now();
+    const turnKey = `demo-${started.toString(36)}`;
+    yield { type: 'start', turnId: turnKey };
+    const turnId = await this.openTurn(wire, target, sessionId, opts.prompt ?? '(approved plan) 실행', false);
+    await this.deps.sleep(420);
+
+    const control = { canceled: false };
+    yield* this.playBeats(beats, target, wire, sessionId, target.key, profile, opts, control);
+    if (control.canceled) {
+      this.cancelTurn(wire, sessionId);
+      yield { type: 'done', stopReason: 'canceled' };
+      return;
+    }
+
+    const chars = beats.reduce((total, beat) => total + (beat.kind === 'text' ? beat.text.length : 0), 0);
+    const inputTokens = 2400 + chars;
+    const outputTokens = Math.max(80, Math.round(chars / 3.2));
+    const usage = { inputTokens, outputTokens, costUsd: this.costOf(profile, inputTokens, outputTokens) };
+    yield { type: 'usage', usage };
+    wire.push('session.event', { type: 'turn_completed', usage: this.usageFrames(usage) }, sessionId);
+    wire.result(turnId, { turnId: turnKey, stopReason: 'completed', usage: this.usageFrames(usage) });
     yield { type: 'done', stopReason: 'completed' };
   }
 }

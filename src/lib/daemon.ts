@@ -22,6 +22,7 @@
  */
 
 import { RpcClient, RpcError, rpcErrorHint, type HelloPayload, type ServerEvent, type SocketFactory, wsUrlFor } from './rpc';
+import type { WireTap } from './inspector';
 import type {
   ChatMessage,
   DaemonHealth,
@@ -77,6 +78,8 @@ export interface DaemonConfig {
 export interface DaemonDeps {
   fetchImpl?: typeof fetch;
   socketFactory?: SocketFactory;
+  /** The inspector's tap: every JSON-RPC frame on this transport. */
+  tap?: WireTap;
 }
 
 export interface DaemonPlanRow {
@@ -375,7 +378,7 @@ export class DaemonTransport {
 
   async connect(): Promise<HelloPayload> {
     const ticket = await this.mintTicket();
-    const rpc = new RpcClient(this.deps.socketFactory);
+    const rpc = new RpcClient(this.deps.socketFactory, 30_000, this.deps.tap);
     this.rpc = rpc;
     const hello = await rpc.connect(wsUrlFor(this.baseUrl, ticket));
     this.hello = hello;

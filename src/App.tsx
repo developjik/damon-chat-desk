@@ -4,10 +4,13 @@ import type { PaletteHandlers } from './lib/commands';
 import { copyText, downloadPayload } from './lib/download';
 import type { ExportFormat } from './lib/export';
 import type { PlanDecision, ReplySlot, TransportKind } from './lib/types';
+import type { ScenarioId } from './lib/scenarios';
 import { CommandPalette } from './components/CommandPalette';
 import { Composer } from './components/Composer';
 import { ConnectPanel } from './components/ConnectPanel';
 import { ExportMenu } from './components/ExportMenu';
+import { Inspector, InspectorToggle } from './components/Inspector';
+import { ScenarioLauncher, ScenarioStrip } from './components/ScenarioLauncher';
 import { Sidebar } from './components/Sidebar';
 import { Transcript } from './components/Transcript';
 
@@ -20,7 +23,17 @@ const SUGGESTIONS: Array<{ label: string; prompt: string }> = [
   { label: 'compare routes', prompt: '스트리밍 응답과 배치 응답, 채팅 UI엔 어느 쪽이 맞아? 비교해 줘.' },
   { label: 'design order', prompt: '데몬이 상태를 들고 있는 채팅 클라이언트의 구현 순서를 잡아줘.' },
 ];
-function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state: DeskState }) {
+function EmptyState({
+  onPick,
+  onScenario,
+  busy,
+  state,
+}: {
+  onPick: (prompt: string) => void;
+  onScenario: (id: ScenarioId) => void;
+  busy: boolean;
+  state: DeskState;
+}) {
   return (
     <div className="empty">
       <div className="empty-mark mono">damon / chat desk</div>
@@ -34,8 +47,9 @@ function EmptyState({ onPick, state }: { onPick: (prompt: string) => void; state
         {state.connection.transport === 'demo' ? ' 지금은 시뮬레이션된 데모 데몬으로 동작합니다.' : ''}
       </p>
       <p className="empty-kbd mono">
-        <span>⌘K</span> / <span>Ctrl+K</span> — 커맨드 팔레트
+        <span>⌘K</span> / <span>Ctrl+K</span> — 커맨드 팔레트 · <span>⌘I</span> — JSON-RPC 인스펙터
       </p>
+      <ScenarioStrip busy={busy} onRun={onScenario} />
       <div className="suggestions">
         {SUGGESTIONS.map((suggestion) => (
           <button type="button" key={suggestion.label} className="suggestion" onClick={() => onPick(suggestion.prompt)}>
@@ -70,6 +84,7 @@ export function App({ desk }: AppProps) {
   const state = useSyncExternalStore(desk.subscribe, desk.getSnapshot);
   const [connectOpen, setConnectOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [launcherOpen, setLauncherOpen] = useState(false);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const [toast, setToast] = useState<string | null>(null);
   const conversation = state.conversations.find((entry) => entry.id === state.activeId) ?? null;
@@ -81,9 +96,9 @@ export function App({ desk }: AppProps) {
     return () => clearTimeout(timer);
   }, [state.notice]);
 
-  // Cmd/Ctrl+K opens the palette; Esc stops the live turn when no overlay
-  // owns the key. The palette and the connect panel handle their own Esc.
-  const overlayOpen = paletteOpen || connectOpen;
+  // Cmd/Ctrl+K opens the palette, Cmd/Ctrl+I the inspector; Esc closes
+  // the topmost overlay, or stops the live turn when none is open.
+  const overlayOpen = paletteOpen || connectOpen || launcherOpen;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && (event.key === 'k' || event.key === 'K')) {
@@ -91,13 +106,26 @@ export function App({ desk }: AppProps) {
         setPaletteOpen((open) => !open);
         return;
       }
-      if (event.key === 'Escape' && !overlayOpen) {
-        desk.stop();
+      if ((event.metaKey || event.ctrlKey) && (event.key === 'i' || event.key === 'I')) {
+        event.preventDefault();
+        desk.toggleInspector();
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (launcherOpen) {
+          setLauncherOpen(false);
+          return;
+        }
+        if (!overlayOpen && desk.getSnapshot().inspector.open) {
+          desk.toggleInspector(false);
+          return;
+        }
+        if (!overlayOpen) desk.stop();
       }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [desk, overlayOpen]);
+  }, [desk, overlayOpen, launcherOpen]);
 
   const connect = (transport: TransportKind, baseUrl: string, opts: { masterToken?: string; deviceToken?: string }) => {
     void desk.connect(transport, baseUrl, opts).then(() => setConnectOpen(false));
@@ -145,6 +173,11 @@ export function App({ desk }: AppProps) {
     desk.notify(copied ? 'Markdown을 클립보드에 복사했습니다' : '클립보드 복사가 차단되었습니다 — 다운로드를 쓰세요');
   };
 
+  const runScenario = (id: ScenarioId) => {
+    setLauncherOpen(false);
+    void desk.runScenario(id);
+  };
+
   const paletteHandlers: PaletteHandlers = useMemo(
     () => ({
       newConversation: () => desk.newConversation(),
@@ -159,12 +192,15 @@ export function App({ desk }: AppProps) {
       setPrimary: (key) => desk.setPrimary(key),
       setSecondary: (key) => desk.setSecondary(key),
       stop: () => desk.stop(),
+      runScenario,
+      toggleInspector: () => desk.toggleInspector(),
+      openScenarios: () => setLauncherOpen(true),
     }),
     [desk, conversation?.id],
   );
 
   return (
-    <div className="app">
+    <div className={`app ${state.inspector.open ? 'with-inspector' : ''}`}>
       <Sidebar
         state={state}
         onNew={() => desk.newConversation()}
@@ -234,6 +270,16 @@ export function App({ desk }: AppProps) {
               </span>
               <span className="palette-trigger-key mono">K</span>
             </button>
+            <button
+              type="button"
+              className="ghost-btn tiny scenarios-btn"
+              onClick={() => setLauncherOpen(true)}
+              title="실전 에이전트 시나리오 (리팩토링 · PR 리뷰 · 장애 분석)"
+            >
+              <span aria-hidden>▸</span>
+              <span className="scenarios-btn-label">시나리오</span>
+            </button>
+            <InspectorToggle tap={desk.wire} open={state.inspector.open} onToggle={() => desk.toggleInspector()} />
             <ExportMenu
               disabled={!conversation || conversation.messages.length === 0}
               onExport={exportConversation}
@@ -254,7 +300,14 @@ export function App({ desk }: AppProps) {
           onRespond={(slot, actionId) => respond(slot, actionId)}
           onFork={(message) => fork(message.id)}
           onPlan={(message, slot, decision, feedback) => plan(message.id, slot, decision, feedback)}
-          emptyState={<EmptyState state={state} onPick={(prompt) => void desk.send(prompt)} />}
+          emptyState={
+            <EmptyState
+              state={state}
+              busy={state.busy}
+              onPick={(prompt) => void desk.send(prompt)}
+              onScenario={runScenario}
+            />
+          }
         />
 
         <Composer
@@ -274,6 +327,17 @@ export function App({ desk }: AppProps) {
         />
       </main>
 
+      <Inspector
+        tap={desk.wire}
+        open={state.inspector.open}
+        filter={state.inspector.filter}
+        protocol={state.connection.transport === 'openai' ? 'sse' : 'jsonrpc'}
+        onFilter={(filter) => desk.setInspectorFilter(filter)}
+        onClose={() => desk.toggleInspector(false)}
+        onClear={() => desk.clearWire()}
+        onNotify={(message) => desk.notify(message)}
+      />
+
       <ConnectPanel
         open={connectOpen}
         state={state}
@@ -285,6 +349,8 @@ export function App({ desk }: AppProps) {
       />
 
       <CommandPalette open={paletteOpen} state={state} handlers={paletteHandlers} onClose={closePalette} />
+
+      <ScenarioLauncher open={launcherOpen} busy={state.busy} onClose={() => setLauncherOpen(false)} onRun={runScenario} />
 
       {toast ? <div className="toast mono">{toast}</div> : null}
     </div>

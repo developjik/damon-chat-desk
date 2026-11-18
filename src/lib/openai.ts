@@ -5,11 +5,16 @@
  * This is the wire shape the desk speaks when it is not talking to a
  * Damon daemon (LM Studio, llama.cpp, LiteLLM, any gateway). README
  * principle 2: the UI only knows this schema.
+ *
+ * With a `WireTap` attached the same traffic lands in the inspector: the
+ * HTTP request as one TX frame and every SSE `data:` block as an RX
+ * chunk, so an OpenAI-mode turn is inspectable next to a daemon turn.
  */
 
 import { SSEParser, decodeStream, type SSEFrame } from './sse';
 import { targetsFromModels, type OpenAIModel } from './targets';
 import { fetcher } from './http';
+import type { WireTap } from './inspector';
 import type { RouteTarget, StreamEvent } from './types';
 
 export interface OpenAIOptions {
@@ -17,6 +22,35 @@ export interface OpenAIOptions {
   apiKey?: string;
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
+  /** Where the frames of this call are recorded (the inspector). */
+  tap?: WireTap;
+}
+
+/** One SSE frame as the inspector shows it: the event name and its JSON. */
+function recordChunk(tap: WireTap | undefined, frame: SSEFrame): void {
+  if (!tap) return;
+  let data: unknown = frame.data;
+  if (frame.data !== '[DONE]') {
+    try {
+      data = JSON.parse(frame.data) as unknown;
+    } catch {
+      data = frame.data;
+    }
+  }
+  const chunk = data as { choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>; usage?: unknown } | null;
+  const delta = chunk?.choices?.[0]?.delta?.content ?? '';
+  tap.record({
+    dir: 'rx',
+    kind: 'chunk',
+    method: frame.event === 'message' ? 'chat.completion.chunk' : frame.event,
+    protocol: 'sse',
+    status: 'ok',
+    payload: {
+      event: frame.event,
+      data,
+      ...(typeof delta === 'string' && delta ? { delta } : {}),
+    },
+  });
 }
 
 export function joinUrl(baseUrl: string, path: string): string {
@@ -30,10 +64,29 @@ function authHeaders(apiKey?: string): Record<string, string> {
 /** `/v1/models` → routes. Throws with the server's message on failure. */
 export async function listModels(opts: OpenAIOptions): Promise<RouteTarget[]> {
   const doFetch = fetcher(opts.fetchImpl);
-  const response = await doFetch(joinUrl(opts.baseUrl, '/v1/models'), {
+  const url = joinUrl(opts.baseUrl, '/v1/models');
+  const sentAt = Date.now();
+  const response = await doFetch(url, {
     method: 'GET',
     headers: { Accept: 'application/json', ...authHeaders(opts.apiKey) },
     signal: opts.signal,
+  });
+  opts.tap?.record({
+    dir: 'tx',
+    kind: 'request',
+    method: 'https GET /v1/models',
+    protocol: 'http',
+    at: sentAt,
+    payload: { method: 'GET', url },
+  });
+  opts.tap?.record({
+    dir: 'rx',
+    kind: response.ok ? 'result' : 'error',
+    method: 'https GET /v1/models',
+    protocol: 'http',
+    latencyMs: Date.now() - sentAt,
+    status: response.ok ? 'ok' : 'error',
+    payload: { status: response.status },
   });
   if (!response.ok) {
     throw new Error(`/v1/models → ${response.status} ${response.statusText}`.trim());
@@ -79,7 +132,9 @@ export async function* streamChat(
   };
   if (opts.request.streamOptions !== false) body.stream_options = { include_usage: true };
 
-  const response = await doFetch(joinUrl(opts.baseUrl, '/v1/chat/completions'), {
+  const url = joinUrl(opts.baseUrl, '/v1/chat/completions');
+  const sentAt = Date.now();
+  const response = await doFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -89,7 +144,30 @@ export async function* streamChat(
     body: JSON.stringify(body),
     signal: opts.signal,
   });
-
+  opts.tap?.record({
+    dir: 'tx',
+    kind: 'request',
+    method: 'https POST /v1/chat/completions',
+    protocol: 'http',
+    at: sentAt,
+    payload: {
+      method: 'POST',
+      url,
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      body,
+    },
+  });
+  if (!response.ok) {
+    opts.tap?.record({
+      dir: 'rx',
+      kind: 'error',
+      method: 'https POST /v1/chat/completions',
+      protocol: 'http',
+      latencyMs: Date.now() - sentAt,
+      status: 'error',
+      payload: { status: response.status, statusText: response.statusText },
+    });
+  }
   if (!response.ok) {
     let detail = '';
     try {
@@ -110,6 +188,15 @@ export async function* streamChat(
   if (!response.body || contentType.includes('application/json')) {
     // Non-streaming answer (or a server that always answers JSON).
     const json = (await response.json()) as ChatCompletionChunk;
+    opts.tap?.record({
+      dir: 'rx',
+      kind: 'result',
+      method: 'chat.completion',
+      protocol: 'http',
+      latencyMs: Date.now() - sentAt,
+      status: 'ok',
+      payload: json,
+    });
     const text = json.choices?.[0]?.message?.content ?? json.choices?.[0]?.delta?.content ?? '';
     if (text) yield { type: 'delta', text };
     yield { type: 'done', usage: mapUsage(json) };
@@ -122,6 +209,7 @@ export async function* streamChat(
 
   for await (const chunk of decodeStream(response.body)) {
     for (const frame of parser.push(chunk)) {
+      recordChunk(opts.tap, frame);
       const result = applyFrame(frame, (delta) => ({ type: 'delta', text: delta }));
       if (result === 'done') {
         yield { type: 'done', stopReason: finishReason, usage };
@@ -135,6 +223,7 @@ export async function* streamChat(
     }
   }
   for (const frame of parser.flush()) {
+    recordChunk(opts.tap, frame);
     const result = applyFrame(frame, (delta) => ({ type: 'delta', text: delta }));
     if (result === 'done') break;
     if (result.kind === 'delta') yield result.event;

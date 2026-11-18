@@ -6,7 +6,14 @@
  * pushes carry no id and an `event` name. The socket factory is
  * injectable so the handshake and the event fan-out are unit-tested
  * against a fake socket instead of a daemon.
+ *
+ * Every frame this client puts on the wire or takes off it is also
+ * handed to the optional `WireTap`, which is what the inspector renders.
+ * The tap never changes behaviour: a frame is recorded after it has been
+ * sent or parsed.
  */
+
+import type { WireTap } from './inspector';
 
 export interface SocketLike {
   send(data: string): void;
@@ -69,6 +76,8 @@ interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  method: string;
+  sentAt: number;
 }
 
 export interface HelloPayload {
@@ -91,6 +100,7 @@ export class RpcClient {
   constructor(
     private readonly factory: SocketFactory = defaultSocketFactory,
     private readonly requestTimeoutMs = 30_000,
+    private readonly tap?: WireTap,
   ) {}
 
   get connected(): boolean {
@@ -134,6 +144,13 @@ export class RpcClient {
         if (!frame) return;
         if ('hello' in frame && frame.hello) {
           this.hello = frame.hello;
+          this.tap?.record({
+            dir: 'rx',
+            kind: 'hello',
+            method: 'hello',
+            protocol: 'jsonrpc',
+            payload: { hello: frame.hello },
+          });
           if (!settled) {
             settled = true;
             clearTimeout(timer);
@@ -146,6 +163,14 @@ export class RpcClient {
           return;
         }
         if ('event' in frame && typeof frame.event === 'string') {
+          this.tap?.record({
+            dir: 'rx',
+            kind: 'notification',
+            method: frame.event,
+            protocol: 'jsonrpc',
+            sessionId: typeof frame.sessionId === 'string' ? frame.sessionId : undefined,
+            payload: frame,
+          });
           for (const handler of this.handlers) {
             handler({
               event: frame.event,
@@ -174,12 +199,25 @@ export class RpcClient {
         this.pending.delete(id);
         reject(new Error(`${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
+      const sentAt = Date.now();
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
         timer,
+        method,
+        sentAt,
       });
-      socket.send(JSON.stringify({ id, method, params }));
+      const envelope = { id, method, params };
+      this.tap?.record({
+        dir: 'tx',
+        kind: 'request',
+        method,
+        protocol: 'jsonrpc',
+        id,
+        sessionId: typeof params.sessionId === 'string' ? params.sessionId : undefined,
+        payload: envelope,
+      });
+      socket.send(JSON.stringify(envelope));
     });
   }
 
@@ -188,6 +226,16 @@ export class RpcClient {
     if (!pending) return;
     this.pending.delete(id);
     clearTimeout(pending.timer);
+    this.tap?.record({
+      dir: 'rx',
+      kind: frame.error ? 'error' : 'result',
+      method: pending.method,
+      protocol: 'jsonrpc',
+      id,
+      latencyMs: Date.now() - pending.sentAt,
+      status: frame.error ? 'error' : 'ok',
+      payload: frame,
+    });
     if (frame.error) pending.reject(new RpcError(frame.error));
     else pending.resolve(frame.result);
   }

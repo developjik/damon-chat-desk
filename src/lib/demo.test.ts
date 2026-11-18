@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEMO_ROUTES, DemoTransport, chunkText, composeReply, detectIntent } from './demo';
+import { WireTap } from './inspector';
 import { mergeToolCall } from './tools';
 import type { StreamEvent, ToolCall } from './types';
 
@@ -165,5 +166,55 @@ describe('DemoTransport.streamTurn', () => {
     expect(entries.some((entry) => entry.status === 'pending')).toBe(true);
     expect(instant.memory()).toHaveLength(2);
     expect(instant.memoryUsage().limit).toBeGreaterThan(0);
+  });
+});
+
+describe('demo wire', () => {
+  it('records turn.start, assistant deltas and turn.cancel for an aborted turn', async () => {
+    const wire = new WireTap(400, { now: () => 1_700_000_000_000 });
+    const demo = new DemoTransport({ sleep: async () => undefined, now: () => 1_700_000_000_000, random: () => 0.5 });
+    demo.setTap(wire);
+    const controller = new AbortController();
+    let seen = 0;
+    let deltas = 0;
+    for await (const event of demo.streamTurn('SSE 파서 버그 어떻게 잡아?', DEMO_ROUTES[0], {
+      signal: controller.signal,
+      sessionId: 'conv-test',
+    })) {
+      seen += 1;
+      if (event.type === 'delta') deltas += 1;
+      if (seen === 3) controller.abort();
+    }
+    expect(deltas).toBeGreaterThan(0);
+    const frames = wire.getSnapshot().frames;
+    expect(frames.some((frame) => frame.dir === 'tx' && frame.method === 'turn.start')).toBe(true);
+    expect(
+      frames.some((frame) => frame.dir === 'rx' && frame.method === 'session.event' && (frame.payload as { data?: { kind?: string } }).data?.kind === 'assistant_message'),
+    ).toBe(true);
+    expect(frames.some((frame) => frame.dir === 'tx' && frame.method === 'turn.cancel')).toBe(true);
+    expect(
+      frames.some((frame) => frame.dir === 'rx' && frame.method === 'session.event' && (frame.payload as { data?: { type?: string } }).data?.type === 'turn_canceled'),
+    ).toBe(true);
+    // pushes carry the session; responses are matched by id, as on the wire
+    expect(
+      frames.filter((frame) => frame.kind === 'notification').every((frame) => frame.sessionId === 'conv-test'),
+    ).toBe(true);
+  });
+
+  it('records session.fork and turn.steer as request/response pairs', () => {
+    const wire = new WireTap(50, { now: () => 1000 });
+    const demo = new DemoTransport({ sleep: async () => undefined, now: () => 1000, random: () => 0.5 });
+    demo.setTap(wire);
+    demo.addSession({ sessionId: 'conv-1', backend: 'claude', title: '테스트', createdAt: 1000 });
+    const forked = demo.forkSession('conv-1', '테스트');
+    demo.steer('보안 먼저', 'claude/claude-sonnet-4-5', 'conv-1');
+    const frames = wire.getSnapshot().frames;
+    expect(forked).toBeTruthy();
+    expect(frames.filter((frame) => frame.method === 'session.fork' && frame.id !== undefined)).toHaveLength(2);
+    expect(
+      frames.some((frame) => frame.dir === 'rx' && frame.method === 'session.fork' && (frame.payload as { result?: { sessionId?: string } }).result?.sessionId === forked),
+    ).toBe(true);
+    expect(frames.some((frame) => frame.dir === 'tx' && frame.method === 'turn.steer')).toBe(true);
+    expect(wire.getSnapshot().inflight).toBe(0);
   });
 });
