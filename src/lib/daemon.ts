@@ -33,6 +33,7 @@ import {
 } from './rpc';
 import type { WireTap } from './inspector';
 import { DeliveryTracker } from './delivery';
+import { normalizeSessionStatus } from './phases';
 import type {
   ChatMessage,
   DaemonHealth,
@@ -42,8 +43,10 @@ import type {
   PlanDecision,
   ProtocolCapability,
   ProtocolState,
+  RecoveredSession,
   ReplySlot,
   RouteTarget,
+  SessionStatusRow,
   StreamEvent,
   Usage,
 } from './types';
@@ -77,6 +80,14 @@ export function normalizeBaseUrl(input: string): string {
   // how a browser reaches a daemon whose own routes send no CORS headers.
   if (trimmed.startsWith('/')) return trimmed;
   return `http://${trimmed}`;
+}
+
+/** What `session.status` answered, with the capability's verdict attached. */
+export interface SessionStatusResult {
+  /** False when this daemon never promised `capabilities.sessionPhase`. */
+  supported: boolean;
+  rows: SessionStatusRow[];
+  recovered: RecoveredSession[];
 }
 
 export interface DaemonConfig {
@@ -497,6 +508,30 @@ export class DaemonTransport {
     if (opts.backend) params.backend = opts.backend;
     const result = await this.client.request<{ sessions?: DaemonSessionRow[] }>('session.list', params);
     return Array.isArray(result.sessions) ? result.sessions : [];
+  }
+
+  /**
+   * `session.status {}` → live sessions with their phase, plus `recovered`.
+   *
+   * `turnId` and `pendingAsk` are additive: whichever the daemon omits is
+   * simply absent on the row (a claim can land before a turn id exists).
+   * Gated on `capabilities.sessionPhase`, so a daemon that predates the field
+   * set is never asked and an old client/server pair behaves exactly as
+   * before; a daemon that advertises it but answers `-32601` (partial
+   * upgrade) is reported as unsupported instead of failing the read.
+   */
+  async sessionStatus(): Promise<SessionStatusResult> {
+    if (!this.supports('sessionPhase')) return { supported: false, rows: [], recovered: [] };
+    try {
+      const raw = await this.client.request<unknown>('session.status', {}, 10_000);
+      const { rows, recovered } = normalizeSessionStatus(raw);
+      return { supported: true, rows, recovered };
+    } catch (error) {
+      // A daemon that advertises the capability but does not answer the
+      // method is mid-upgrade; report it rather than break the status line.
+      if (error instanceof RpcError && error.code === -32601) return { supported: false, rows: [], recovered: [] };
+      throw error;
+    }
   }
 
   /** `session.rename {sessionId, title}` → `{renamed}`. */

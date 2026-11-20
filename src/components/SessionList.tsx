@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import type { SessionStatusRow } from '../lib/types';
+import { PhaseChip } from './SessionPhase';
 
 /** One row of either list — the daemon's sessions and the local ones. */
 export interface SessionItem {
@@ -9,6 +11,8 @@ export interface SessionItem {
   badge?: string;
   active: boolean;
   archived: boolean;
+  /** What `session.status` says this session is doing right now. */
+  phase?: SessionStatusRow;
 }
 
 interface SessionListProps {
@@ -125,7 +129,12 @@ export function SessionList({
                 onClick={() => onSelect(item)}
                 title={item.title}
               >
-                {item.badge ? <span className="backend-chip mono">{item.badge}</span> : null}
+                {item.badge || item.phase ? (
+                  <span className="session-flags">
+                    {item.badge ? <span className="backend-chip mono">{item.badge}</span> : null}
+                    <PhaseChip row={item.phase} compact />
+                  </span>
+                ) : null}
                 <span className="session-title">{item.title}</span>
                 <span className="session-meta mono">{item.meta}</span>
               </button>

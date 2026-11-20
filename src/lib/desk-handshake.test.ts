@@ -109,6 +109,7 @@ const MODERN_HELLO = {
     idempotentTurns: true,
     turnLedger: true,
     versionNegotiation: true,
+    sessionPhase: true,
   },
   daemon: 'damond',
   version: '0.9.0',
@@ -156,7 +157,7 @@ describe('DeskController — protocol v2 handshake', () => {
     expect(connection.protocol?.capabilities.idempotentTurns).toBe(true);
     expect(connection.probeNote).toContain('protocol v2');
     expect(connection.probeNote).toContain('(negotiated)');
-    expect(connection.probeNote).toContain('6/6 capabilities');
+    expect(connection.probeNote).toContain('7/7 capabilities');
   });
 
   it('says plainly what an older daemon cannot do', async () => {
@@ -174,7 +175,7 @@ describe('DeskController — protocol v2 handshake', () => {
     expect(connection.status).toBe('live');
     expect(connection.protocol).toMatchObject({ version: 2, negotiated: false });
     expect(connection.protocol?.capabilities.eventSeq).toBe(false);
-    expect(connection.probeNote).toContain('0/6 capabilities');
+    expect(connection.probeNote).toContain('0/7 capabilities');
   });
 
   it('refuses to pretend it can talk to a daemon on another protocol', async () => {

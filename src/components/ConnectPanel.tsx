@@ -135,6 +135,11 @@ export function ConnectPanel({ open, state, onClose, onConnect, onDemo, onPair, 
                     ? '이 데몬은 이벤트 커서(seq)와 누락 고지(session.gap · session.snapshot_required)를 보냅니다 — 응답 카드가 유실 구간을 표시하고, 재전송은 같은 키로 돌아갑니다.'
                     : '이 데몬은 프로토콜 v2 이전입니다 — 유실 고지와 멱등 재전송이 없으므로 카드가 부분 응답을 구분하지 못합니다.'}
                 </p>
+                <p className="panel-note">
+                  {protocol.capabilities.sessionPhase
+                    ? 'sessionPhase — session.status가 세션별 phase(유휴·턴 실행·답 대기)와 대기 중인 ask, 그리고 이전 데몬이 턴 도중 남긴 recovered 세션을 알려줍니다. 사이드바 칩과 복구 배너가 이것을 읽습니다.'
+                    : 'sessionPhase 없음 — 이 데몬은 세션 위상을 보고하지 않으므로, 칩은 이 창이 직접 돌리는 턴에 대해서만 표시됩니다.'}
+                </p>
               </div>
             ) : null}
             {staticHttps ? (

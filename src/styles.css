@@ -4140,3 +4140,188 @@ a {
     display: none;
   }
 }
+
+/* ------------------------------------------------------- session phase */
+
+/* Badges and phase chips share one line above the title; a long ask label
+   truncates instead of pushing the row menu off the sidebar. */
+.session-flags {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  /* A long ask label must not run under the row's ⋯ menu. */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.phase-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 15px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 9.5px;
+  line-height: 1;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.phase-chip .phase-word {
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  flex: none;
+}
+
+.phase-chip.busy {
+  color: #a9b4ff;
+  border-color: rgba(124, 140, 248, 0.35);
+  background: var(--accent-dim);
+}
+
+.phase-chip.awaiting_input {
+  color: #e3c07a;
+  border-color: rgba(216, 165, 66, 0.4);
+  background: rgba(216, 165, 66, 0.1);
+}
+
+.phase-chip.idle {
+  color: var(--text-faint);
+}
+
+.phase-dot {
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.phase-chip.busy .phase-dot,
+.phase-chip.awaiting_input .phase-dot {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.phase-ask {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.phase-kind {
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  flex: none;
+}
+
+.phase-label {
+  font-size: 10px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 130px;
+}
+
+/* --------------------------------------------------- recovered banner */
+
+/* A daemon that died mid-turn says so here until the session is resumed.
+   Amber, not red: nothing is broken now, but the last answer is short. */
+.recovered-banner {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 18px 10px;
+  border-bottom: 1px solid rgba(216, 165, 66, 0.28);
+  background: rgba(216, 165, 66, 0.06);
+}
+
+.recovered-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.recovered-chip {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #e3c07a;
+  border: 1px solid rgba(216, 165, 66, 0.4);
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: rgba(216, 165, 66, 0.1);
+}
+
+.recovered-title {
+  font-size: 11.5px;
+  color: #e3c07a;
+}
+
+.recovered-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.recovered-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.recovered-id {
+  font-size: 10.5px;
+  color: var(--text);
+}
+
+.recovered-backend {
+  font-size: 9.5px;
+  color: var(--text-faint);
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.recovered-what {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.recovered-row .ghost-btn:first-of-type {
+  margin-left: auto;
+}
+
+@media (max-width: 720px) {
+  .recovered-banner {
+    padding: 8px 12px 9px;
+  }
+
+  .recovered-row .ghost-btn:first-of-type {
+    margin-left: 0;
+  }
+
+  /* 390px: the header keeps the phase and the ask kind, not its label. */
+  .topbar-sub .phase-chip .phase-label {
+    display: none;
+  }
+}

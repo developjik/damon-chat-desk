@@ -53,7 +53,8 @@ export type ProtocolCapability =
   | 'connGap'
   | 'idempotentTurns'
   | 'turnLedger'
-  | 'versionNegotiation';
+  | 'versionNegotiation'
+  | 'sessionPhase';
 
 export const PROTOCOL_CAPABILITIES: ProtocolCapability[] = [
   'eventSeq',
@@ -62,7 +63,75 @@ export const PROTOCOL_CAPABILITIES: ProtocolCapability[] = [
   'idempotentTurns',
   'turnLedger',
   'versionNegotiation',
+  'sessionPhase',
 ];
+
+/* ------------------------------------------------------------------ */
+/* session phase — what a session is doing right now (session.status)  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The daemon's own word for a session's state. `awaiting_input` is still
+ * a live, unreapable turn — the agent is parked on the user's answer.
+ */
+export type SessionPhase = 'idle' | 'busy' | 'awaiting_input';
+
+/** The ask a parked turn is waiting on, as the ledger remembers it. */
+export interface PendingAskSummary {
+  /** The live `permission.respond` handle. */
+  requestId: string;
+  /** `permission` | `question` | `plan` on the wire; kept open on purpose. */
+  kind: string;
+  /** Human label — tool name or ask title. Absent for an ask that has none. */
+  label: string;
+  askedAtMs: number;
+}
+
+/**
+ * One row of `session.status`. `turnId` and `pendingAsk` are additive and
+ * may be absent (a claim lands before the backend reports its turn id), so
+ * both are optional here rather than empty strings.
+ */
+export interface SessionStatusRow {
+  sessionId: string;
+  backend: string;
+  phase: SessionPhase;
+  /** `phase !== 'idle'` as the daemon reports it — a parked turn is busy too. */
+  busy: boolean;
+  turnId?: string;
+  idleSecs?: number;
+  pendingAsk?: PendingAskSummary;
+  /**
+   * Where this row came from: the daemon's ledger (`daemon`), or this tab's
+   * own stream when the daemon is too old to report phases (`local`).
+   */
+  source?: 'daemon' | 'local';
+}
+
+/**
+ * A session the previous daemon left mid-turn. It is `idle` now — the boot
+ * converged it — and `phase` says what it was doing when it died. Resuming
+ * the session drops the mark; the daemon prunes it after a day.
+ */
+export interface RecoveredSession {
+  sessionId: string;
+  backend: string;
+  phase: SessionPhase;
+  /** When the dead daemon was found holding it. */
+  sinceMs: number;
+  turnId?: string;
+}
+
+/** Everything `session.status` taught this desk. */
+export interface SessionStatusView {
+  /** True when the daemon advertised `capabilities.sessionPhase`. */
+  supported: boolean;
+  rows: SessionStatusRow[];
+  recovered: RecoveredSession[];
+  updatedAt?: number;
+  /** The last read failed — the rows below are the previous snapshot. */
+  error?: string;
+}
 
 /** What the handshake settled on, for the connection card. */
 export interface ProtocolState {

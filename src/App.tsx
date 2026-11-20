@@ -3,7 +3,8 @@ import type { DeskController, DeskState } from './lib/desk';
 import type { PaletteHandlers } from './lib/commands';
 import { copyText, downloadPayload } from './lib/download';
 import type { ExportFormat } from './lib/export';
-import type { PlanDecision, ReplySlot, TransportKind } from './lib/types';
+import { localSessionPhases, mergeSessionPhases, sessionPhaseIndex } from './lib/phases';
+import type { PlanDecision, RecoveredSession, ReplySlot, TransportKind } from './lib/types';
 import type { ScenarioId } from './lib/scenarios';
 import { CommandPalette } from './components/CommandPalette';
 import { Composer } from './components/Composer';
@@ -11,6 +12,7 @@ import { ConnectPanel } from './components/ConnectPanel';
 import { ExportMenu } from './components/ExportMenu';
 import { Inspector, InspectorToggle } from './components/Inspector';
 import { ScenarioLauncher, ScenarioStrip } from './components/ScenarioLauncher';
+import { PhaseChip, RecoveredBanner } from './components/SessionPhase';
 import { Sidebar } from './components/Sidebar';
 import { Transcript } from './components/Transcript';
 
@@ -88,6 +90,25 @@ export function App({ desk }: AppProps) {
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const [toast, setToast] = useState<string | null>(null);
   const conversation = state.conversations.find((entry) => entry.id === state.activeId) ?? null;
+
+  // The active session's phase, from the daemon's ledger with this tab's
+  // own stream over it — the header says what the visible turn is doing.
+  const phases = sessionPhaseIndex(
+    mergeSessionPhases(
+      state.sessionStatus.rows,
+      localSessionPhases(state.conversations, state.connection.transport),
+    ),
+  );
+  const activePhase = (() => {
+    if (!conversation) return undefined;
+    const ids =
+      state.connection.transport === 'demo' ? [conversation.id] : Object.values(conversation.daemonSessions ?? {});
+    for (const id of ids) {
+      const row = phases.get(id);
+      if (row) return row;
+    }
+    return undefined;
+  })();
 
   useEffect(() => {
     if (!state.notice) return;
@@ -178,6 +199,15 @@ export function App({ desk }: AppProps) {
     void desk.runScenario(id);
   };
 
+  // "기록 열기": view the interrupted session's history. It does not
+  // resume the session, so the banner keeps the warning — only `이어받기`
+  // (or the daemon's own prune) clears it.
+  const openRecoveredHistory = (row: RecoveredSession) => {
+    const known = state.daemonSessions.find((entry) => entry.sessionId === row.sessionId);
+    if (known) void desk.openDaemonSession(known);
+    else void desk.resumeRecoveredSession(row.sessionId);
+  };
+
   const paletteHandlers: PaletteHandlers = useMemo(
     () => ({
       newConversation: () => desk.newConversation(),
@@ -247,6 +277,7 @@ export function App({ desk }: AppProps) {
                 {state.connection.transport === 'demo' ? 'demo' : state.connection.transport === 'daemon' ? 'daemon' : 'openai'}
               </span>
               <span>{state.connection.targets.length} routes</span>
+              {activePhase ? <PhaseChip row={activePhase} /> : null}
               {conversation ? <span className="faint">· {conversation.messages.length} messages</span> : null}
             </div>
           </div>
@@ -290,6 +321,12 @@ export function App({ desk }: AppProps) {
             </button>
           </div>
         </header>
+
+        <RecoveredBanner
+          rows={state.sessionStatus.recovered}
+          onResume={(sessionId) => void desk.resumeRecoveredSession(sessionId)}
+          onOpen={openRecoveredHistory}
+        />
 
         <Transcript
           messages={conversation?.messages ?? []}

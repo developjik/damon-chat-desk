@@ -1,8 +1,9 @@
 import type { DeskState } from '../lib/desk';
 import type { ExportFormat } from '../lib/export';
 import { conversationMeta, filterConversations, filterDaemonRows, relativeTime } from '../lib/sessions';
+import { localSessionPhases, mergeSessionPhases, sessionPhaseIndex } from '../lib/phases';
 import type { DaemonSessionRow } from '../lib/daemon';
-import type { MemoryEntry, MemoryFilter, MemoryScope } from '../lib/types';
+import type { Conversation, MemoryEntry, MemoryFilter, MemoryScope, SessionStatusRow } from '../lib/types';
 import { MemoryPanel } from './MemoryPanel';
 import { SessionList, type SessionItem } from './SessionList';
 
@@ -68,6 +69,21 @@ export function Sidebar({
   const archivedCount = state.conversations.filter((conversation) => conversation.archived === true).length;
   const active = state.conversations.find((conversation) => conversation.id === state.activeId) ?? null;
 
+  // What each session is doing: the daemon's ledger, with this tab's own
+  // streaming phase laid over it (a poll lags the turn on screen).
+  const phases = sessionPhaseIndex(
+    mergeSessionPhases(state.sessionStatus.rows, localSessionPhases(state.conversations, connection.transport)),
+  );
+  const phaseOfConversation = (conversation: Conversation): SessionStatusRow | undefined => {
+    const ids =
+      connection.transport === 'demo' ? [conversation.id] : Object.values(conversation.daemonSessions ?? {});
+    for (const id of ids) {
+      const row = phases.get(id);
+      if (row) return row;
+    }
+    return undefined;
+  };
+
   const conversationItems: SessionItem[] = filterConversations(state.conversations, {
     text: query,
     archived: showArchived,
@@ -81,6 +97,7 @@ export function Sidebar({
       meta: conversationMeta(conversation),
       active: conversation.id === state.activeId,
       archived: conversation.archived === true,
+      phase: phaseOfConversation(conversation),
     }));
 
   const daemonRows = filterDaemonRows(state.daemonSessions, { text: query, includeArchived: showArchived });
@@ -93,6 +110,7 @@ export function Sidebar({
     badge: row.backend,
     active: false,
     archived: row.archived === true,
+    phase: phases.get(row.sessionId),
   }));
 
   const rowOf = (item: SessionItem): DaemonSessionRow | undefined => daemonByKey.get(item.key);
