@@ -7,6 +7,8 @@
 #
 # 빌드 단계의 VITE_BASE_PATH가 이 리포의 Pages 경로(/damon-chat-desk/)를
 # vite base로 넘긴다 — 없으면 asset이 /assets/로 나가 404가 된다.
+# 액션은 모두 Node 24 런타임을 쓰는 메이저로 고정한다(2025-09 Node 20 deprecation).
+# 빌드 노드 버전은 ci.yml과 같게 22를 쓴다.
 name: Deploy to GitHub Pages
 
 on:
@@ -27,11 +29,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install
@@ -45,9 +47,9 @@ jobs:
           VITE_BASE_PATH: /damon-chat-desk/
         run: npm run build
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
 
@@ -59,4 +61,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
