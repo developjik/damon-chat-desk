@@ -147,7 +147,7 @@ npm run dev        # http://127.0.0.1:5173/  (base 기본값 /)
 | 명령 | 결과 |
 | --- | --- |
 | `npm run dev` | 개발 서버 + `/dm` 프록시(아래) |
-| `npm test` | vitest 전 시나리오 264개 |
+| `npm test` | vitest 전 시나리오 350개 |
 | `npm run typecheck` | `tsc` 타입 검사만 |
 | `npm run build` | `dist/` (base `/`) — 자동 배포는 `VITE_BASE_PATH=/damon-chat-desk/ npm run build` |
 | `npm run preview` | 빌드 결과를 4173에서 확인 |
@@ -201,7 +201,7 @@ CORS·혼합 콘텐츠에 걸리지 않는다.
 (`workflow_dispatch`)을 받는다. 실행 기록은 [Actions 탭](https://github.com/developjik/damon-chat-desk/actions/workflows/deploy.yml)에서 본다.
 
 - Settings → Pages → Source는 **GitHub Actions**로 지정되어 있다(`build_type: workflow`). `gh-pages` 브랜치는 쓰지 않는다.
-- 단계: `npm ci` → `npm test`(264개) → `npm run build` → `upload-pages-artifact` → `deploy-pages`. 테스트가 깨지면 배포도 나가지 않는다.
+- 단계: `npm ci` → `npm test`(350개) → `npm run build` → `upload-pages-artifact` → `deploy-pages`. 테스트가 깨지면 배포도 나가지 않는다.
 - 빌드 단계가 `VITE_BASE_PATH=/damon-chat-desk/`를 넘긴다. 이 값이 없으면 asset이 `/assets/…`로 나가 프로젝트 페이지에서 404가 된다.
 - 산출물은 `dist/` 정적 파일뿐이고, 중간 서버도 서버 비용도 없다.
 

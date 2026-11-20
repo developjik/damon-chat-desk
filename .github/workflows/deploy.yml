@@ -1,11 +1,14 @@
-# GitHub Pages 자동 배포 워크플로.
+# GitHub Pages 자동 배포 워크플로 — 실제로 도는 파일.
 #
-# 이 파일은 `.github/workflows/deploy.yml`로 옮겨야 동작한다.
-# (지금은 커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로
-#  푸시할 수 없다 — 웹 에디터에서 복사해 넣으면 그대로 동작한다.)
+# 이 파일이 원본이고, `docs/deploy.workflow.yml`이 문서용 사본이다. 둘은 같은
+# 내용을 유지한다. `.github/workflows/` 경로는 workflows 스코프가 없는 푸시를
+# GitHub이 거부하므로 수정은 웹 에디터로 한다.
 #
 # Settings → Pages → Source: GitHub Actions 로 한 번 지정한 뒤,
 # main에 푸시할 때마다 테스트·빌드·배포가 돈다.
+#
+# 액션은 모두 Node 24 런타임을 쓰는 메이저로 고정한다(2025-09 Node 20 deprecation).
+# 빌드 노드 버전은 ci.yml과 같게 22를 쓴다.
 #
 # 빌드 단계의 VITE_BASE_PATH가 이 리포의 Pages 경로(/damon-chat-desk/)를
 # vite base로 넘긴다 — 없으면 asset이 /assets/로 나가 404가 된다.
@@ -29,11 +32,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install
@@ -47,9 +50,9 @@ jobs:
           VITE_BASE_PATH: /damon-chat-desk/
         run: npm run build
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
 
@@ -61,4 +64,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

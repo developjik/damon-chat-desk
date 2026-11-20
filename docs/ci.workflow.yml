@@ -14,6 +14,7 @@
 #
 # 배포(deploy.yml)는 main 푸시에서 같은 검사를 다시 돈다. 이 워크플로는
 # PR에서 먼저 막는 용도다 — 머지 전에 빨간불을 보기 위한 것.
+# 액션은 모두 Node 24 런타임을 쓰는 메이저로 고정한다(2025-09 Node 20 deprecation).
 name: ci
 
 on:
@@ -34,9 +35,9 @@ jobs:
     name: typecheck · test · build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

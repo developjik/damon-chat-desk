@@ -33,8 +33,8 @@
 | Build (Pages base) | `VITE_BASE_PATH=/damon-chat-desk/ npm run build` | 프로젝트 페이지 asset 경로 |
 
 트리거는 `push`(main) · `pull_request` · `workflow_dispatch`이고, 같은 브랜치에서 새 커밋이 오면
-이전 실행은 취소된다(`concurrency.cancel-in-progress`). Node는 워크플로에서 **22**, `npm ci`를 쓰므로
-`package-lock.json`이 바뀐 PR은 lockfile도 함께 커밋해야 한다.
+이전 실행은 취소된다(`concurrency.cancel-in-progress`). 두 워크플로 모두 Node **22**를 쓰고,
+`npm ci`를 쓰므로 `package-lock.json`이 바뀐 PR은 lockfile도 함께 커밋해야 한다.
 
 ## 로컬에서 같은 검사
 
@@ -46,9 +46,20 @@ npm run build
 VITE_BASE_PATH=/damon-chat-desk/ npm run build
 ```
 
+## 액션 버전
+
+모든 액션은 Node 24 런타임을 쓰는 메이저로 고정돼 있다 — CI 로그의 `Node.js 20 is deprecated`
+경고(2025-09 공지)를 없애기 위해서다.
+
+| 액션 | 버전 |
+| --- | --- |
+| [`actions/checkout`](https://github.com/actions/checkout) | `v7` |
+| [`actions/setup-node`](https://github.com/actions/setup-node) | `v7` |
+| [`actions/configure-pages`](https://github.com/actions/configure-pages) | `v6` |
+| [`actions/upload-pages-artifact`](https://github.com/actions/upload-pages-artifact) | `v5` (내부 `upload-artifact` v7) |
+| [`actions/deploy-pages`](https://github.com/actions/deploy-pages) | `v5` |
+
 ## 참고
 
-- `deploy.yml`은 지금 Node 20으로 돈다. `ci.yml`은 22를 쓴다 — 둘을 같은 버전으로 맞추고 싶으면
-  `deploy.yml`의 `node-version`만 고치면 된다(이 파일은 그 경로를 건드리지 않는다).
-- 배포 워크플로 사본(`docs/deploy.workflow.yml`)과 같은 이유로, 이 리포에서 워크플로 파일은
-  코드 PR과 분리해 다루는 편이 안전하다.
+- 워크플로 파일은 `.github/workflows/`와 `docs/` 사본 두 곳을 항상 같이 고친다. 이 리포에서
+  워크플로 수정은 웹 에디터(또는 `workflows` 스코프가 있는 자격증명)로 한다.
