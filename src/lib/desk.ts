@@ -9,6 +9,7 @@
 import { DaemonTransport, normalizeBaseUrl, type DaemonSessionRow } from './daemon';
 import { DEMO_ROUTES, DemoTransport, composeReply } from './demo';
 import { probe } from './detect';
+import { mergeDelivery } from './delivery';
 import { buildExport, type ExportFormat, type ExportPayload } from './export';
 import { needsDemoFallback, pageOrigin } from './hosting';
 import { WireTap, type InspectorFilter } from './inspector';
@@ -20,6 +21,7 @@ import { RpcError } from './rpc';
 import { scenarioById, type ScenarioBeat, type ScenarioId } from './scenarios';
 import { makeTarget } from './targets';
 import { mergeToolCall } from './tools';
+import { PROTOCOL_CAPABILITIES } from './types';
 import type {
   ChatMessage,
   ConnectionState,
@@ -132,6 +134,14 @@ export class DeskController {
   private slotMeta = new Map<string, { scenario?: ScenarioId; newSession?: boolean; followUp?: ScenarioBeat[] }>();
   /** Slots stopped by hand — late tokens from the wire are dropped. */
   private stoppedSlots = new Set<string>();
+  /**
+   * daemon sessionId → the newest event `seq` the desk has seen. Protocol
+   * v2's cursor: handing it back as a turn's baseline is what turns a
+   * first-frame jump into a reported gap instead of a silent one.
+   */
+  private sessionCursors = new Map<string, number>();
+  /** Turns whose stream admitted a hole — the answer needs a re-read. */
+  private needResync = new Set<string>();
   private emitTimer: ReturnType<typeof setTimeout> | null = null;
   /** Every frame the desk speaks, for the inspector. */
   readonly wire: WireTap;
@@ -403,6 +413,8 @@ export class DeskController {
         const targets = await daemon.routes(result.health?.backends ?? hello.backends ?? []);
         this.daemon?.close();
         this.daemon = daemon;
+        const protocol = daemon.protocol;
+        const offered = PROTOCOL_CAPABILITIES.filter((key) => protocol.capabilities[key]);
         this.set({
           savedMasterToken: opts.masterToken,
           savedDeviceToken: opts.deviceToken,
@@ -412,7 +424,10 @@ export class DeskController {
             baseUrl: base,
             version: `damond ${hello.version}`,
             targets,
-            probeNote: `${hello.backends?.length ?? 0} backends · protocol v${hello.protocol}`,
+            // What the handshake settled on, not what the desk hopes for:
+            // a daemon that predates protocol v2 simply lists fewer.
+            probeNote: `${hello.backends?.length ?? 0} backends · protocol v${protocol.version}${protocol.negotiated ? ' (negotiated)' : ''} · ${offered.length}/${PROTOCOL_CAPABILITIES.length} capabilities`,
+            protocol,
           },
         });
         this.ensureRouteSelection(targets);
@@ -1042,6 +1057,7 @@ export class DeskController {
       } catch {
         messages = [];
       }
+      void this.watchSession(row.sessionId);
     }
     const conversation: Conversation = {
       id: uid('conv'),
@@ -1070,6 +1086,78 @@ export class DeskController {
       this.patchConversation(convId, { messages });
     } catch {
       /* keep what we have */
+    }
+  }
+
+  /**
+   * Subscribe to a session's numbering (`session.watch`) without turning
+   * on it.
+   *
+   * The answer's `cursor` is where that session's event numbering stands,
+   * which is the baseline the next turn's gap detection needs. A session
+   * that is not live (an old row, or a daemon that restarted) answers
+   * -32001; nothing to do — the prompt path resumes it.
+   */
+  private async watchSession(sessionId: string): Promise<void> {
+    const daemon = this.daemon;
+    if (!daemon) return;
+    try {
+      const watch = await daemon.watchSession(sessionId);
+      if (typeof watch.cursor === 'number') this.sessionCursors.set(sessionId, watch.cursor);
+    } catch {
+      /* not live, or an older daemon: both are handled where the turn runs */
+    }
+  }
+
+  /**
+   * Repair one reply after the delivery layer admitted a hole
+   * (`session.snapshot_required`): the journal shed this turn's prefix, so
+   * what streamed is not the whole answer.
+   *
+   * The store is the complete copy — `run_turn` assembles the turn there
+   * even when the journal overflowed — so the stored text wins when it is
+   * longer. It never shrinks the answer: a write that has not landed yet
+   * must not delete text the user already read, and the card says `stale`
+   * instead of pretending.
+   */
+  private async resyncSlot(convId: string, messageId: string, slotId: string): Promise<void> {
+    const stored = await this.storedAnswer(convId);
+    const current = this.slotAt(convId, messageId, slotId)?.text ?? '';
+    const filled = stored && stored.length > current.length ? stored : null;
+    this.patchSlot(convId, messageId, slotId, (slot) => ({
+      text: filled ?? slot.text,
+      delivery: mergeDelivery(slot.delivery, {
+        dropped: 0,
+        snapshotRequired: true,
+        resynced: filled ? true : undefined,
+        stale: filled ? undefined : true,
+      }),
+    }));
+    this.set({
+      notice: filled
+        ? '누락된 구간을 데몬 저장본에서 다시 읽었습니다 (session.messages)'
+        : '응답 일부가 유실됐습니다 — 데몬 저장본에도 아직 그 구간이 없습니다 (session.messages)',
+    });
+  }
+
+  /** The last answer `session.messages` holds for this conversation, if any. */
+  private async storedAnswer(convId: string): Promise<string | null> {
+    const daemon = this.daemon;
+    const conversation = this.state.conversations.find((entry) => entry.id === convId);
+    if (!daemon || !conversation) return null;
+    const entries = Object.entries(conversation.daemonSessions);
+    // Compare mode holds two sessions; re-reading one side would speak for both.
+    if (entries.length !== 1) return null;
+    const [provider, sessionId] = entries[0];
+    const target =
+      this.state.connection.targets.find((entry) => entry.provider === provider) ??
+      makeTarget({ provider, model: '', modelLabel: 'default model', source: 'backend' });
+    try {
+      const rows = await daemon.messages(sessionId, target);
+      const slots = [...rows].reverse().flatMap((message) => message.slots ?? []);
+      return slots.find((slot) => slot.text)?.text ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -1311,6 +1399,10 @@ export class DeskController {
         status: slot.status === 'error' ? 'error' : slot.status === 'canceled' ? 'canceled' : 'done',
         endedAt: Date.now(),
       }));
+      // The journal shed this turn's prefix, so what streamed is not the
+      // whole answer. Between turns is the safe moment to re-read: the
+      // daemon persists the assembled turn, and nothing else is arriving.
+      if (this.needResync.delete(convId)) await this.resyncSlot(convId, messageId, slotId);
     } catch (error) {
       const canceled = aborter.signal.aborted;
       this.patchSlot(convId, messageId, slotId, () => ({
@@ -1370,12 +1462,31 @@ export class DeskController {
     if (!conversation) throw new Error('conversation vanished');
     let sessionId = conversation.daemonSessions[target.provider];
     if (!sessionId) {
-      sessionId = await daemon.createSession({ backend: target.provider, model: target.model || undefined });
+      const created = await daemon.createSession({ backend: target.provider, model: target.model || undefined });
+      sessionId = created.sessionId;
+      if (typeof created.cursor === 'number') this.sessionCursors.set(sessionId, created.cursor);
       this.patchConversation(convId, { daemonSessions: { ...conversation.daemonSessions, [target.provider]: sessionId } });
       this.patchSlot(convId, slotRef.messageId, slotRef.slotId, { notice: `daemon session ${sessionId.slice(0, 8)} 생성` });
     }
     this.patchSlot(convId, slotRef.messageId, slotRef.slotId, { daemonSessionId: sessionId });
-    return daemon.streamTurn(sessionId, outgoing, { signal });
+    const slot = this.slotAt(convId, slotRef.messageId, slotRef.slotId);
+    // One key per turn, kept on the slot: a retry after a transport failure
+    // re-sends it, so the daemon replays the attempt instead of running a
+    // second one. A slot whose turn really ran mints a new key on retry.
+    // Only sent to a daemon that promised the capability — an older one
+    // would ignore it, and relying on an unadvertised promise is how a
+    // client ends up lying to itself.
+    const keyed = daemon.supports('idempotentTurns');
+    const idempotencyKey = keyed ? slot?.idempotencyKey ?? `${slotRef.slotId}-${uid('k')}` : undefined;
+    if (keyed && slot?.idempotencyKey !== idempotencyKey) {
+      this.patchSlot(convId, slotRef.messageId, slotRef.slotId, { idempotencyKey });
+    }
+    return daemon.streamTurn(sessionId, outgoing, {
+      signal,
+      idempotencyKey,
+      baseline: this.sessionCursors.get(sessionId) ?? null,
+      onCursor: (cursor) => this.sessionCursors.set(sessionId, cursor),
+    });
   }
 
   private applyEvent(convId: string, messageId: string, slotId: string, event: StreamEvent): void {
@@ -1478,6 +1589,37 @@ export class DeskController {
       case 'error':
         this.patchSlot(convId, messageId, slotId, { status: 'error', error: event.message, endedAt: Date.now() });
         break;
+      // Protocol v2: the connection, not the turn, lost events. The card
+      // says so under its header instead of passing a holed stream off as
+      // the whole answer.
+      case 'gap':
+        this.patchSlot(
+          convId,
+          messageId,
+          slotId,
+          (slot) => ({ delivery: mergeDelivery(slot.delivery, { dropped: event.dropped, cursor: event.cursor }) }),
+          false,
+        );
+        break;
+      case 'snapshot_required':
+        this.needResync.add(convId);
+        this.patchSlot(
+          convId,
+          messageId,
+          slotId,
+          (slot) => ({ delivery: mergeDelivery(slot.delivery, { dropped: 0, snapshotRequired: true, cursor: event.cursor }) }),
+          false,
+        );
+        break;
+      case 'delivery':
+        this.patchSlot(
+          convId,
+          messageId,
+          slotId,
+          (slot) => ({ delivery: mergeDelivery(slot.delivery, event.patch) }),
+          false,
+        );
+        break;
       default:
         break;
     }
@@ -1492,12 +1634,20 @@ export class DeskController {
     const slot = conversation.messages[index].slots?.find((entry) => entry.id === slotId);
     const userMessage = [...conversation.messages.slice(0, index)].reverse().find((message) => message.role === 'user');
     if (!slot || !userMessage?.text) return;
+    // Reuse the turn's key only while the daemon may never have started it
+    // (a transport failure: no turnId came back). Then a re-send is the
+    // same attempt, and the daemon replays it instead of running a second
+    // one. Once a turn really ran, a retry means "run it again" — a fresh
+    // key says exactly that.
+    const resendSameTurn = !slot.turnId && slot.status === 'error';
     this.patchSlot(convId, messageId, slotId, {
       text: '',
       error: undefined,
       usage: undefined,
       notice: undefined,
       ask: undefined,
+      delivery: undefined,
+      idempotencyKey: resendSameTurn ? slot.idempotencyKey : undefined,
       status: 'queued',
       startedAt: Date.now(),
       firstTokenAt: undefined,
@@ -1607,7 +1757,7 @@ export class DeskController {
         }
         if (transport !== 'daemon' || !this.daemon) throw new Error('이 전송 계층은 방향 수정을 지원하지 않습니다');
         if (!ref.slot.daemonSessionId) throw new Error('데몬 세션을 알 수 없습니다');
-        const ack = await this.daemon.steer(ref.slot.daemonSessionId, body);
+        const ack = await this.steerOnce(ref.slot.daemonSessionId, body, noteId);
         if (ack) {
           this.patchSlot(convId, ref.messageId, ref.slot.id, (slot) => ({
             steers: (slot.steers ?? []).map((note) =>
@@ -1626,6 +1776,31 @@ export class DeskController {
           ),
         }));
         this.set({ notice: `steer 실패: ${message}` });
+      }
+    }
+  }
+
+  /**
+   * `turn.steer` under a key, sent at most twice.
+   *
+   * The first attempt can lose its ack without losing the steer, and a
+   * plain re-send would hand the agent the same words twice. Under one key
+   * the daemon replays the first delivery instead, and `-32006` on the
+   * retry is it saying that delivery is still in flight — which is also
+   * delivered.
+   */
+  private async steerOnce(sessionId: string, text: string, key: string): Promise<string> {
+    const daemon = this.daemon;
+    if (!daemon) throw new Error('데몬이 연결되어 있지 않습니다');
+    try {
+      return await daemon.steer(sessionId, text, key);
+    } catch (error) {
+      if (error instanceof RpcError) throw error;
+      try {
+        return await daemon.steer(sessionId, text, key);
+      } catch (retry) {
+        if (retry instanceof RpcError && retry.code === -32006) return '';
+        throw retry;
       }
     }
   }

@@ -21,8 +21,18 @@
  * see `detect.ts`.
  */
 
-import { RpcClient, RpcError, rpcErrorHint, type HelloPayload, type ServerEvent, type SocketFactory, wsUrlFor } from './rpc';
+import {
+  RpcClient,
+  RpcError,
+  capabilitiesOf,
+  rpcErrorHint,
+  type HelloPayload,
+  type ServerEvent,
+  type SocketFactory,
+  wsUrlFor,
+} from './rpc';
 import type { WireTap } from './inspector';
+import { DeliveryTracker } from './delivery';
 import type {
   ChatMessage,
   DaemonHealth,
@@ -30,6 +40,8 @@ import type {
   MemoryScope,
   PermissionAsk,
   PlanDecision,
+  ProtocolCapability,
+  ProtocolState,
   ReplySlot,
   RouteTarget,
   StreamEvent,
@@ -105,6 +117,32 @@ export interface DaemonSessionRow {
   pinned?: boolean;
   archived?: boolean;
 }
+
+/** Where a session's event numbering stands, as the daemon reports it. */
+export interface SessionCursor {
+  sessionId: string;
+  backend?: string;
+  /** Replay-tagged frames the subscription sent for missed history. */
+  replayed?: number;
+  /** The newest `seq` handed out so far; the next live frame continues it. */
+  cursor?: number;
+  subscribed?: boolean;
+}
+
+/** `turn.start`'s answer — including the Keyed-retry shapes. */
+export interface TurnStartResult {
+  turnId?: string;
+  stopReason?: string;
+  usage?: unknown;
+  /** A repeated `idempotencyKey`: this answer is the first attempt's. */
+  duplicate?: boolean;
+  /** That attempt is still running; this connection is now subscribed to it. */
+  inProgress?: boolean;
+  detached?: boolean;
+}
+
+/** A turn attached to another connection may never end; bound the wait. */
+const ATTACHED_TURN_TIMEOUT_MS = 10 * 60_000;
 
 /** `session.export` — the daemon's own serialization of one session. */
 export interface DaemonSessionExport {
@@ -390,6 +428,23 @@ export class DaemonTransport {
     return this.rpc;
   }
 
+  /** What the handshake settled on (protocol version, range, capabilities). */
+  get protocol(): ProtocolState {
+    const hello = this.hello;
+    return {
+      version: hello?.protocol ?? 0,
+      min: hello?.minProtocol,
+      supported: hello?.supported,
+      negotiated: this.rpc?.negotiated ?? false,
+      capabilities: capabilitiesOf(hello),
+    };
+  }
+
+  /** True when this daemon promised `capability` in its `hello`. */
+  supports(capability: ProtocolCapability): boolean {
+    return capabilitiesOf(this.hello)[capability];
+  }
+
   /** Every (backend, model) the daemon can route to. */
   async routes(fallbackBackends: string[] = []): Promise<RouteTarget[]> {
     const backends = this.hello?.backends?.length ? this.hello.backends : fallbackBackends;
@@ -471,12 +526,35 @@ export class DaemonTransport {
     return this.client.request<DaemonSessionExport>('session.export', { sessionId }, 20_000);
   }
 
-  async createSession(input: { backend: string; model?: string; cwd?: string }): Promise<string> {
+  async createSession(input: { backend: string; model?: string; cwd?: string }): Promise<SessionCursor> {
     const params: Record<string, unknown> = { backend: input.backend };
     if (input.model) params.model = input.model;
     if (input.cwd) params.cwd = input.cwd;
-    const result = await this.client.request<{ sessionId: string }>('session.create', params);
-    return result.sessionId;
+    const result = await this.client.request<SessionCursor>('session.create', params);
+    if (!result?.sessionId) throw new Error('session.create returned no sessionId');
+    return result;
+  }
+
+  /**
+   * `session.resume` — attaches (or re-attaches) this connection to a
+   * session and answers with its cursor. Idempotent, and the recovery
+   * path for `-32001`: a daemon restart leaves the row but not the live
+   * session, and the turn is what has to be resumed before it can run.
+   */
+  async resumeSession(sessionId: string): Promise<SessionCursor> {
+    const result = await this.client.request<SessionCursor>('session.resume', { sessionId }, 30_000);
+    if (!result?.sessionId) throw new Error('session.resume returned no sessionId');
+    return result;
+  }
+
+  /**
+   * `session.watch` — subscribe this connection to a live session without
+   * creating or turning on it. The answer's `cursor` is that session's
+   * numbering, which is what makes a later gap detectable.
+   */
+  async watchSession(sessionId: string): Promise<SessionCursor> {
+    const result = await this.client.request<SessionCursor>('session.watch', { sessionId }, 15_000);
+    return result;
   }
 
   async messages(sessionId: string, target: RouteTarget): Promise<ChatMessage[]> {
@@ -556,9 +634,16 @@ export class DaemonTransport {
    * Redirect the turn that is already running. The daemon refuses this
    * with -32002 when the backend cannot steer; callers queue the text as
    * the next prompt instead.
+   *
+   * `idempotencyKey` is the Keyed contract: a steer delivered twice would
+   * hand the agent the same words twice, so a repeat replays the first
+   * delivery (`{result}`, `duplicate`), and a repeat while it is still in
+   * flight answers `-32006`.
    */
-  async steer(sessionId: string, prompt: string): Promise<string> {
-    const result = await this.client.request<{ result?: string }>('turn.steer', { sessionId, prompt }, 20_000);
+  async steer(sessionId: string, prompt: string, idempotencyKey?: string): Promise<string> {
+    const params: Record<string, unknown> = { sessionId, prompt };
+    if (idempotencyKey) params.idempotencyKey = idempotencyKey;
+    const result = await this.client.request<{ result?: string; duplicate?: boolean }>('turn.steer', params, 20_000);
     return typeof result?.result === 'string' ? result.result : '';
   }
 
@@ -604,32 +689,98 @@ export class DaemonTransport {
    * Run one turn and stream it. `turn.start` itself resolves when the
    * turn ends, so the events are what the UI renders; the resolution is
    * the authoritative end (usage included).
+   *
+   * Protocol v2 is what makes a stream honest about itself here:
+   *
+   *   - every frame's `seq` is fed to a `DeliveryTracker`, so a jump in
+   *     the numbering becomes a `gap` event even if the daemon's own
+   *     `session.gap` never arrives;
+   *   - `session.gap` and `session.snapshot_required` are the connection's
+   *     own losses, not the turn's, and they ride out as their own events;
+   *   - catch-up frames (`replay: true`) are skipped: the desk already
+   *     renders that history, and a replayed `turn_completed` would end
+   *     this turn before it began;
+   *   - `idempotencyKey` makes a re-send safe. A `{duplicate, inProgress}`
+   *     answer means the turn is already running on another connection:
+   *     this generator keeps consuming that turn's stream instead of
+   *     reporting a phantom empty answer;
+   *   - `-32001` (session not live, e.g. after a daemon restart) is
+   *     recovered once: `session.resume`, then the same key again.
    */
   async *streamTurn(
     sessionId: string,
     prompt: string,
-    opts: { signal?: AbortSignal; memoryOwner?: string } = {},
+    opts: {
+      signal?: AbortSignal;
+      memoryOwner?: string;
+      /** One per turn; a re-send of the same key replays instead of re-running. */
+      idempotencyKey?: string;
+      /** Where the session stood before this turn (create/resume/watch cursor). */
+      baseline?: number | null;
+      /** The session's numbering as frames arrive, so the desk can keep it. */
+      onCursor?: (cursor: number) => void;
+    } = {},
   ): AsyncGenerator<StreamEvent> {
     const rpc = this.client;
+    const tracker = new DeliveryTracker(opts.baseline ?? null);
     const queue: StreamEvent[] = [];
-    let wake: (() => void) | null = null;
+    // A holder, not a bare `let`: the loop assigns the waker and the async
+    // settle path calls it, and TypeScript narrows a bare variable to null
+    // across those two closures.
+    const signal: { wake: (() => void) | null } = { wake: null };
+    /** No frame may be pushed any more — the turn is over for this consumer. */
     let closed = false;
     let sawDone = false;
+    /** `turn.start` answered (or failed): the request no longer gates the loop. */
+    let requestSettled = false;
+    /** The turn runs on another connection and this one just watches it. */
+    let attached = false;
     let aborted = false;
+    // A holder, not a bare `let`: the timer is armed from inside the
+    // async IIFE below and cleared from the generator body.
+    const timers: { attached?: ReturnType<typeof setTimeout> } = {};
 
     const push = (event: StreamEvent) => {
       if (closed) return;
       queue.push(event);
-      wake?.();
+      signal.wake?.();
+    };
+
+    const noteCursor = () => {
+      const cursor = tracker.cursor;
+      if (cursor !== null) opts.onCursor?.(cursor);
     };
 
     const off = rpc.onEvent((frame: ServerEvent) => {
-      if (frame.event !== 'session.event' || frame.sessionId !== sessionId) return;
-      const mapped = mapSessionEvent(frame.data);
-      if (!mapped) return;
-      if (mapped.type === 'done') sawDone = true;
-      if (mapped.type === 'error') sawDone = true;
-      push(mapped);
+      if (frame.sessionId !== sessionId) return;
+      if (frame.event === 'session.event') {
+        const skipped = tracker.observe(frame.seq);
+        // Catch-up history is already on screen; it is not this answer.
+        if (frame.replay === true) {
+          noteCursor();
+          return;
+        }
+        if (skipped > 0) push({ type: 'gap', dropped: skipped, cursor: tracker.cursor ?? undefined });
+        noteCursor();
+        const mapped = mapSessionEvent(frame.data);
+        if (!mapped) return;
+        if (mapped.type === 'done' || mapped.type === 'error') sawDone = true;
+        push(mapped);
+        return;
+      }
+      if (frame.event === 'session.gap') {
+        // The daemon counted this one itself; adopting its cursor keeps the
+        // frame that follows from being counted a second time.
+        const dropped = tracker.admit(frame.dropped, frame.cursor);
+        noteCursor();
+        if (dropped > 0) push({ type: 'gap', dropped, cursor: frame.cursor });
+        return;
+      }
+      if (frame.event === 'session.snapshot_required') {
+        tracker.start(frame.cursor);
+        noteCursor();
+        push({ type: 'snapshot_required', cursor: frame.cursor, reason: frame.reason });
+      }
     });
 
     const onAbort = () => {
@@ -640,27 +791,71 @@ export class DaemonTransport {
 
     const params: Record<string, unknown> = { sessionId, prompt };
     if (opts.memoryOwner) params.memoryOwner = opts.memoryOwner;
-    const turn = rpc
-      .request<{ turnId?: string; stopReason?: string; usage?: unknown }>('turn.start', params, 10 * 60_000)
-      .then((result) => {
+    if (opts.idempotencyKey) params.idempotencyKey = opts.idempotencyKey;
+
+    const startTurn = () => rpc.request<TurnStartResult>('turn.start', params, 10 * 60_000);
+
+    const settle = (async () => {
+      let result: TurnStartResult;
+      try {
+        try {
+          result = await startTurn();
+        } catch (error) {
+          if (!(error instanceof RpcError) || error.code !== -32001) throw error;
+          // The session outlived its process (`-32001`). Resume it, then
+          // send the SAME key: the daemon replays the attempt if it still
+          // remembers it, so a restart costs a resume, not a second turn.
+          const resumed = await this.resumeSession(sessionId).catch(() => null);
+          if (!resumed) throw error;
+          tracker.start(resumed.cursor);
+          noteCursor();
+          push({ type: 'delivery', patch: { resumed: true } });
+          push({ type: 'notice', text: '세션이 살아있지 않아 session.resume 후 같은 키로 다시 보냈습니다' });
+          result = await startTurn();
+        }
+
+        if (result?.duplicate === true && result.inProgress === true) {
+          // The first attempt owns the turn; this connection was just
+          // subscribed to it. End on its own event, not on this answer.
+          attached = true;
+          push({ type: 'delivery', patch: { attached: true, duplicate: true } });
+          push({ type: 'notice', text: '이미 실행 중인 턴에 연결했습니다 — 이 스트림이 그 턴입니다' });
+          timers.attached = setTimeout(() => {
+            push({ type: 'error', message: '실행 중인 턴이 끝나기를 기다리다 시간이 초과되었습니다 — 다른 서피스에서 계속되고 있을 수 있습니다' });
+            requestSettled = true;
+            closed = true;
+            signal.wake?.();
+          }, ATTACHED_TURN_TIMEOUT_MS);
+          return;
+        }
+
+        if (result?.duplicate === true) push({ type: 'delivery', patch: { duplicate: true } });
         if (!sawDone) push({ type: 'done', stopReason: result?.stopReason, usage: mapUsage(result?.usage) });
-      })
-      .catch((error: unknown) => {
-        const message = error instanceof RpcError ? `${error.message}${rpcErrorHint(error.code) ? ` — ${rpcErrorHint(error.code)}` : ''}` : String((error as Error)?.message ?? error);
+      } catch (error) {
+        const message =
+          error instanceof RpcError
+            ? `${error.message}${rpcErrorHint(error.code) ? ` — ${rpcErrorHint(error.code)}` : ''}`
+            : String((error as Error)?.message ?? error);
         push({ type: 'error', message });
-      })
-      .finally(() => {
-        closed = true;
-        wake?.();
-      });
+      } finally {
+        // An attached turn is not over: this consumer keeps reading it
+        // until its own ending event arrives (or the watchdog gives up).
+        if (!attached) {
+          requestSettled = true;
+          closed = true;
+        }
+        if (timers.attached) clearTimeout(timers.attached);
+        signal.wake?.();
+      }
+    })();
 
     try {
       for (;;) {
         if (queue.length === 0) {
-          if (closed) break;
+          if (requestSettled) break;
           await new Promise<void>((resolve) => {
-            wake = () => {
-              wake = null;
+            signal.wake = () => {
+              signal.wake = null;
               resolve();
             };
           });
@@ -668,18 +863,18 @@ export class DaemonTransport {
         }
         const event = queue.shift() as StreamEvent;
         yield event;
-        if (event.type === 'done' || event.type === 'error') {
-          // Keep the loop alive until the request settles so a late
-          // `turn.start` failure is not lost; the finally closes it.
-          if (!closed) continue;
-          break;
-        }
+        if (event.type !== 'done' && event.type !== 'error') continue;
+        // A turn this connection did not start ends on its own event; a
+        // turn it started waits for `turn.start` to settle so a late
+        // failure is not lost.
+        if (attached || requestSettled) break;
       }
       if (aborted && !sawDone) yield { type: 'done', stopReason: 'canceled' };
     } finally {
+      if (timers.attached) clearTimeout(timers.attached);
       off();
       opts.signal?.removeEventListener('abort', onAbort);
-      void turn;
+      void settle;
     }
   }
 

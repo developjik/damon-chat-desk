@@ -907,6 +907,25 @@ a {
   letter-spacing: 0.02em;
 }
 
+/* Protocol v2 delivery honesty: what this connection missed, stated on the
+   card instead of letting a holed stream pass for the whole answer. */
+.slot-delivery {
+  list-style: none;
+  margin: 0;
+  padding: 5px 11px;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(216, 165, 66, 0.07);
+  border-left: 2px solid var(--warn);
+  color: var(--warn);
+  font-size: 10.5px;
+  line-height: 1.55;
+  letter-spacing: 0.01em;
+}
+
+.slot-delivery li + li {
+  margin-top: 2px;
+}
+
 .slot-body {
   padding: 11px 13px 13px;
   font-size: 13.5px;
@@ -2367,6 +2386,56 @@ a {
   font-size: 11px;
   line-height: 1.6;
   color: var(--text-faint);
+}
+
+/* The handshake's verdict — what this daemon promised before a turn ran. */
+.protocol-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0c0c0e;
+}
+
+.protocol-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.protocol-range {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.protocol-flag {
+  margin-left: auto;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.protocol-caps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 10px;
+  margin: 0;
+  padding: 0;
+  font-size: 10px;
+}
+
+.protocol-caps li.on {
+  color: var(--ok);
+}
+
+.protocol-caps li.off {
+  color: var(--text-faint);
+  opacity: 0.7;
 }
 
 .divider {

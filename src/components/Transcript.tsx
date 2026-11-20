@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ChatMessage, PlanDecision, ReplySlot } from '../lib/types';
+import { deliverySummary } from '../lib/delivery';
 import { Markdown } from './Markdown';
 import { PlanCard } from './PlanCard';
 import { ToolViewer } from './ToolViewer';
@@ -63,6 +64,14 @@ function SlotCard({
       </header>
 
       {slot.notice ? <div className="slot-notice mono">{slot.notice}</div> : null}
+
+      {slot.delivery ? (
+        <ul className="slot-delivery mono">
+          {deliverySummary(slot.delivery).map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      ) : null}
 
       {slot.steers && slot.steers.length > 0 ? (
         <div className="steers">

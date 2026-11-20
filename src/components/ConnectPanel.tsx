@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { DeskState } from '../lib/desk';
 import { isLoopbackHost, pageOrigin } from '../lib/hosting';
-import type { TransportKind } from '../lib/types';
+import { PROTOCOL_CAPABILITIES, type TransportKind } from '../lib/types';
 
 interface ConnectPanelProps {
   open: boolean;
@@ -28,6 +28,8 @@ export function ConnectPanel({ open, state, onClose, onConnect, onDemo, onPair, 
   const [deviceToken, setDeviceToken] = useState(state.savedDeviceToken ?? '');
   const [pairingKey, setPairingKey] = useState('');
   const [deviceName, setDeviceName] = useState('chat desk (browser)');
+  // What the handshake actually settled on (protocol v2 negotiation).
+  const protocol = state.connection.transport === 'daemon' ? state.connection.protocol : undefined;
 
   useEffect(() => {
     if (open) setTab(current);
@@ -111,6 +113,30 @@ export function ConnectPanel({ open, state, onClose, onConnect, onDemo, onPair, 
                 로컬 프록시 /dm
               </button>
             </div>
+            {protocol ? (
+              <div className="protocol-card">
+                <div className="protocol-head">
+                  <span className={`pill ${protocol.capabilities.eventSeq ? 'ok' : 'pending'}`}>protocol v{protocol.version}</span>
+                  <span className="protocol-range mono">
+                    min {protocol.min ?? protocol.version}
+                    {protocol.supported?.length ? ` · supported ${protocol.supported.join('/')}` : ''}
+                  </span>
+                  <span className="protocol-flag mono">{protocol.negotiated ? 'negotiated' : 'push hello'}</span>
+                </div>
+                <ul className="protocol-caps mono">
+                  {PROTOCOL_CAPABILITIES.map((key) => (
+                    <li key={key} className={protocol.capabilities[key] ? 'on' : 'off'} title={protocol.capabilities[key] ? 'daemon advertises it' : 'not advertised' }>
+                      {protocol.capabilities[key] ? '✓' : '·'} {key}
+                    </li>
+                  ))}
+                </ul>
+                <p className="panel-note">
+                  {protocol.capabilities.eventSeq
+                    ? '이 데몬은 이벤트 커서(seq)와 누락 고지(session.gap · session.snapshot_required)를 보냅니다 — 응답 카드가 유실 구간을 표시하고, 재전송은 같은 키로 돌아갑니다.'
+                    : '이 데몬은 프로토콜 v2 이전입니다 — 유실 고지와 멱등 재전송이 없으므로 카드가 부분 응답을 구분하지 못합니다.'}
+                </p>
+              </div>
+            ) : null}
             {staticHttps ? (
               <p className="panel-note">
                 이 페이지는 https 정적 호스팅입니다. 브라우저가 <code className="md-code mono">http://127.0.0.1</code> 데몬에 직접 붙지 못하므로(혼합 콘텐츠·사설망 차단),
