@@ -38,6 +38,70 @@ export interface Usage {
 export type SlotStatus = 'queued' | 'streaming' | 'done' | 'error' | 'canceled';
 
 /* ------------------------------------------------------------------ */
+/* protocol v2 — what the daemon says it can do, and what the desk saw  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The additive features `hello` gates (damon-agent-core PR #49). A daemon
+ * that predates them omits the key, and `capabilitiesOf` reads that as
+ * `false` — which is exactly right: every one of these is a promise only
+ * the newer daemon keeps.
+ */
+export type ProtocolCapability =
+  | 'eventSeq'
+  | 'snapshotRequired'
+  | 'connGap'
+  | 'idempotentTurns'
+  | 'turnLedger'
+  | 'versionNegotiation';
+
+export const PROTOCOL_CAPABILITIES: ProtocolCapability[] = [
+  'eventSeq',
+  'snapshotRequired',
+  'connGap',
+  'idempotentTurns',
+  'turnLedger',
+  'versionNegotiation',
+];
+
+/** What the handshake settled on, for the connection card. */
+export interface ProtocolState {
+  /** The version this daemon speaks (`hello.protocol`). */
+  version: number;
+  /** Oldest version it still answers (`hello.minProtocol`). */
+  min?: number;
+  /** Every version it accepts (`hello.supported[]`). */
+  supported?: number[];
+  /** True when the daemon answered a versioned `hello` request. */
+  negotiated: boolean;
+  capabilities: Record<ProtocolCapability, boolean>;
+}
+
+/**
+ * What the delivery layer had to say about one reply: events this
+ * connection never received, and whether the text on screen is the whole
+ * answer. `undefined` on the slot means nothing was lost.
+ */
+export interface SlotDelivery {
+  /** Events dropped on this connection (`session.gap`) or skipped in `seq`. */
+  dropped: number;
+  /** The in-flight journal shed its prefix (`session.snapshot_required`). */
+  snapshotRequired?: boolean;
+  /** The desk re-read `session.messages` and the text below is that copy. */
+  resynced?: boolean;
+  /** The re-read did not happen — the text below may be short. */
+  stale?: boolean;
+  /** `turn.start` answered `{duplicate:true}` — the result was reused. */
+  duplicate?: boolean;
+  /** `{duplicate:true, inProgress:true}` — attached to a turn already running. */
+  attached?: boolean;
+  /** The session was not live: `session.resume` ran and the same key retried. */
+  resumed?: boolean;
+  /** Where the session's event numbering stood when the turn started. */
+  cursor?: number;
+}
+
+/* ------------------------------------------------------------------ */
 /* tool calls — the daemon's ToolCallDetail, normalized                 */
 /* ------------------------------------------------------------------ */
 
@@ -163,6 +227,14 @@ export interface ReplySlot {
   plan?: PlanRequest;
   /** Loaded from daemon history — no timing to report. */
   imported?: boolean;
+  /** What the delivery layer reported for this answer (gaps, resync). */
+  delivery?: SlotDelivery;
+  /**
+   * The key this turn was started with (`turn.start`). Kept on the slot so
+   * a retry after a transport failure re-sends the SAME key: the daemon
+   * then replays the attempt instead of running a second turn.
+   */
+  idempotencyKey?: string;
 }
 
 export interface ChatMessage {
@@ -231,6 +303,8 @@ export interface ConnectionState {
   /** Daemon backends reported by /health, or models from /v1/models. */
   targets: RouteTarget[];
   probeNote?: string;
+  /** The handshake's verdict — only on the daemon transport. */
+  protocol?: ProtocolState;
 }
 
 export interface PermissionAction {
@@ -261,6 +335,22 @@ export type StreamEvent =
   /** The parked ask was settled elsewhere — the card is no longer answerable. */
   | { type: 'plan_resolved'; requestId: string }
   | { type: 'steer'; text: string; at: number }
+  /**
+   * This connection missed `dropped` events (`session.gap`, or a jump in
+   * the session's `seq`). Consumption continues — the events are gone.
+   */
+  | { type: 'gap'; dropped: number; cursor?: number }
+  /**
+   * The in-flight journal shed its prefix: what replayed is not the whole
+   * turn, so the desk must re-read `session.messages`.
+   */
+  | { type: 'snapshot_required'; cursor?: number; reason?: string }
+  /**
+   * A delivery fact that is not a gap: the daemon replayed a result
+   * (`duplicate`), attached this connection to a running turn
+   * (`attached`), or the session had to be resumed first (`resumed`).
+   */
+  | { type: 'delivery'; patch: Partial<SlotDelivery> }
   | { type: 'usage'; usage: Usage }
   | { type: 'done'; stopReason?: string; usage?: Usage }
   | { type: 'error'; message: string };

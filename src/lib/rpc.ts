@@ -14,6 +14,14 @@
  */
 
 import type { WireTap } from './inspector';
+import { PROTOCOL_CAPABILITIES, type ProtocolCapability } from './types';
+
+/** What this client calls itself in `hello`'s `client` field. */
+export const CLIENT_NAME = 'damon-chat-desk';
+export const CLIENT_VERSION = '0.1.0';
+
+/** The MAJOR protocol version this client speaks (protocol v2). */
+export const CLIENT_PROTOCOL = 2;
 
 export interface SocketLike {
   send(data: string): void;
@@ -57,6 +65,8 @@ export function rpcErrorHint(code: number): string {
       return 'session cap reached — close or delete one';
     case -32006:
       return 'a turn is already running on this session';
+    case -32012:
+      return 'the daemon does not speak this protocol version — update the desk or the daemon';
     default:
       return '';
   }
@@ -68,6 +78,19 @@ export interface ServerEvent {
   runId?: string;
   creationId?: string;
   data?: unknown;
+  /**
+   * The session's event cursor, on `session.event` frames. Strictly
+   * increasing per session; a jump means events were lost.
+   */
+  seq?: number;
+  /** True on catch-up history a fresh subscription replays. */
+  replay?: boolean;
+  /** `session.gap` / `session.snapshot_required`: where the numbering stands. */
+  cursor?: number;
+  /** `session.gap`: how many events this connection never received. */
+  dropped?: number;
+  /** `session.snapshot_required`: `journal_overflow` today. */
+  reason?: string;
 }
 
 export type EventHandler = (event: ServerEvent) => void;
@@ -82,12 +105,31 @@ interface Pending {
 
 export interface HelloPayload {
   protocol: number;
+  /** Oldest version the daemon still answers (protocol v2 daemons only). */
+  minProtocol?: number;
+  /** Every version the daemon accepts — present means it negotiates. */
+  supported?: number[];
+  /** Feature gates; an absent key means the daemon does not promise it. */
+  capabilities?: Record<string, unknown>;
   daemon: string;
   version: string;
   backends?: string[];
   methods?: unknown[];
   remoteClients?: number;
-  permissionTimeoutSecs?: number;
+  permissionTimeoutSecs?: number | null;
+}
+
+/** `hello.capabilities` as six booleans; anything absent reads false. */
+export function capabilitiesOf(hello: HelloPayload | null | undefined): Record<ProtocolCapability, boolean> {
+  const raw = hello?.capabilities ?? {};
+  const out = {} as Record<ProtocolCapability, boolean>;
+  for (const key of PROTOCOL_CAPABILITIES) out[key] = raw[key] === true;
+  return out;
+}
+
+/** True when the daemon offered a version range, i.e. it can negotiate. */
+export function negotiatesProtocol(hello: HelloPayload | null | undefined): boolean {
+  return Array.isArray(hello?.supported) && hello.supported.length > 0;
 }
 
 export class RpcClient {
@@ -96,6 +138,8 @@ export class RpcClient {
   private pending = new Map<number, Pending>();
   private handlers = new Set<EventHandler>();
   hello: HelloPayload | null = null;
+  /** True when the handshake was confirmed with a versioned `hello`. */
+  negotiated = false;
 
   constructor(
     private readonly factory: SocketFactory = defaultSocketFactory,
@@ -107,7 +151,15 @@ export class RpcClient {
     return this.socket !== null;
   }
 
-  /** Open the socket and wait for the daemon`s `hello` frame. */
+  /**
+   * Open the socket and wait for the daemon's `hello` frame.
+   *
+   * A daemon that advertises `supported[]` is also asked (`hello` as a
+   * request) to confirm the version this client speaks. That request is
+   * what turns a silent mismatch into one typed failure (-32012); a daemon
+   * that predates negotiation sends no `supported[]` and stays on the old
+   * path, byte for byte.
+   */
   connect(url: string, timeoutMs = 8000): Promise<HelloPayload> {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -118,6 +170,55 @@ export class RpcClient {
         reject(new Error('daemon handshake timed out'));
       }, timeoutMs);
 
+      const finish = (hello: HelloPayload) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(hello);
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      };
+
+      /** Confirm the version, then resolve with the merged `hello`. */
+      const negotiate = (hello: HelloPayload) => {
+        this.request<HelloPayload>(
+          'hello',
+          { protocolVersion: CLIENT_PROTOCOL, client: { name: CLIENT_NAME, version: CLIENT_VERSION } },
+          timeoutMs,
+        )
+          .then((answer) => {
+            this.negotiated = true;
+            const merged: HelloPayload = { ...hello, ...answer };
+            this.hello = merged;
+            finish(merged);
+          })
+          .catch((error: unknown) => {
+            if (error instanceof RpcError && error.code === -32012) {
+              const data = error.data as { supported?: unknown } | undefined;
+              const supported = Array.isArray(data?.supported) ? (data.supported as number[]) : undefined;
+              fail(
+                new Error(
+                  `daemon speaks protocol ${supported?.join('/') ?? '?'} — this desk speaks ${CLIENT_PROTOCOL}. ` +
+                    'Update the desk or the daemon to connect.',
+                ),
+              );
+              return;
+            }
+            // A daemon without the request form answers -32601; the push
+            // hello it already sent is the whole handshake.
+            if (error instanceof RpcError && error.code === -32601) {
+              this.negotiated = false;
+              finish(hello);
+              return;
+            }
+            fail(error instanceof Error ? error : new Error(String(error)));
+          });
+      };
+
       const socket = this.factory(url);
       this.socket = socket;
 
@@ -125,19 +226,12 @@ export class RpcClient {
         /* hello follows on the wire */
       };
       socket.onerror = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(new Error('socket error — check the daemon URL'));
+        fail(new Error('socket error — check the daemon URL'));
       };
       socket.onclose = () => {
         this.socket = null;
         this.failAll(new Error('socket closed'));
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error('socket closed before hello'));
-        }
+        fail(new Error('socket closed before hello'));
       };
       socket.onmessage = (message) => {
         const frame = parseFrame(message.data);
@@ -152,9 +246,10 @@ export class RpcClient {
             payload: { hello: frame.hello },
           });
           if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve(frame.hello);
+            // A daemon that offers a version range is asked to confirm
+            // it; one that does not is already done handshaking.
+            if (negotiatesProtocol(frame.hello)) negotiate(frame.hello);
+            else finish(frame.hello);
           }
           return;
         }
@@ -178,6 +273,11 @@ export class RpcClient {
               runId: typeof frame.runId === 'string' ? frame.runId : undefined,
               creationId: typeof frame.creationId === 'string' ? frame.creationId : undefined,
               data: frame.data,
+              seq: typeof frame.seq === 'number' ? frame.seq : undefined,
+              replay: frame.replay === true,
+              cursor: typeof frame.cursor === 'number' ? frame.cursor : undefined,
+              dropped: typeof frame.dropped === 'number' ? frame.dropped : undefined,
+              reason: typeof frame.reason === 'string' ? frame.reason : undefined,
             });
           }
         }
@@ -271,6 +371,11 @@ interface FrameShape {
   runId?: string;
   creationId?: string;
   data?: unknown;
+  seq?: number;
+  replay?: boolean;
+  cursor?: number;
+  dropped?: number;
+  reason?: string;
 }
 
 export function parseFrame(raw: unknown): FrameShape | null {
