@@ -113,8 +113,9 @@ sequenceDiagram
 - **승인 카드**: 데몬이 `permission_requested`를 보내면 카드에 액션 버튼이 뜨고 `permission.respond`로 응답한다.
 - **실시간 JSON-RPC 인스펙터 (`⌘I` / `Ctrl+I`)**: 헤더의 `JSON-RPC` 토글(프레임 수 배지)로 우측 드로어를 연다. 데모·데몬(`/ws`)·OpenAI 모드에서 실제로 오간 프레임을 타임스탬프·방향(`→ TX` / `← RX`)·메서드·지연(ms)·크기와 함께 스트리밍으로 보여준다 — `turn.start` 요청과 응답(턴이 끝날 때 응답하므로 지연이 곧 턴 길이), `session.event` 푸시(`timeline.assistant_message`·`tool_call`·`permission_requested`), `turn.steer`, `turn.cancel`, `session.fork`, `plan.respond`, OpenAI 모드의 `POST /v1/chat/completions` + SSE 청크까지. **연속된 텍스트 델타는 한 행으로 접힌다** — `← RX session.event ×98 deltas · 2.4s · 11.8KB`처럼 개수·경과 시간·바이트를 붙여 한 줄로 묶고, 누르면 개별 델타 프레임이 펼쳐진다. 툴 호출·승인 요청·계획 응답 같은 프레임이 끼면 접힘이 끊기므로 핵심 프레임이 델타 더미에 묻히지 않고, `group` 토글로 접기를 끄면 예전처럼 프레임 1개 = 행 1개다. 행을 누르면 페이로드 JSON이 펼쳐지고, `전체 / TX / RX / 툴·승인` 필터·`group`·`clear`·`copy`(프레임 전체를 JSON 블록으로)·`follow`(자동 스크롤)를 제공한다. 데몬 모드에서는 `RpcClient`가, 데모에서는 시뮬레이터가 같은 봉투를 탭에 기록하므로 **데모와 실 데몬의 프레임이 같은 화면에서 비교된다**.
 - **실전 에이전트 시나리오 3종**: 헤더 `▸ 시나리오`(또는 커맨드 팔레트)에서 1클릭으로 실행한다. ① **코드 리팩토링** — 380줄 웹훅 핸들러를 `Read`/`Grep`으로 진단하고 계획 카드를 띄운 뒤, 승인하면 `Edit`/`Write`와 `npm test`·`tsc`까지 이어서 실행한다. ② **PR 리뷰** — PR diff·라우트·캐시 구현을 읽고 보안(P1 텐넌트 스코프 누락)·성능·정합성 코멘트와 머지 판단을 남긴다. ③ **장애 분석** — OOMKilled 파드 로그·이벤트·Grafana 메트릭을 시간순으로 맞춰 502의 원인을 특정하고, 승인하면 큐 상한·본문 제한 핫픽스를 적용한다. 각 실행은 데모에서 스크립트를 재생하고(툴 아코디언·계획 카드·`turn.steer` 포함), 데몬·OpenAI 연결에서는 같은 프롬프트를 실제 에이전트에 보낸다.
-- **프로토콜 v2 계약 채택 (전달 정직성 · 멱등 턴)**: 데몬 `hello`의 `minProtocol`·`supported[]`·`capabilities`로 **버전을 협상**하고(`-32012`면 데몬이 말하는 버전을 밝히고 연결을 거부), 연결 카드에 `protocol v2 · 6/6 capabilities`를 적는다. 턴 스트림은 이벤트 커서(`seq`)를 접어 **끊긴 번호를 직접 세고**, `session.gap`·`session.snapshot_required`를 카드 헤더 아래 경고줄로 올린다 — 저널이 잘린 턴은 끝난 뒤 `session.messages`로 다시 읽어 저장본이 더 길 때만 본문을 채운다(`resynced`/`stale`). `turn.start`/`turn.steer`에는 턴 키(`idempotencyKey`)를 붙여, 전송 실패로 끝난 재시도는 같은 키로 재생하고(`{duplicate}`), 이미 다른 연결이 시작한 턴이면 `{duplicate, inProgress}`를 받아 **새 턴을 만들지 않고 그 스트림을 계속 읽는다**. `-32001`(죽은 세션)은 `session.resume` 후 같은 키로 1회 복구한다. 자세히: [`docs/protocol-v2-adoption.md`](docs/protocol-v2-adoption.md).
-- 단위 테스트 307개(SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·버전 협상·전달 커서/갭 추적·데몬 이벤트 매핑·키드 턴 스트림·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러·와이어 탭/프레임 필터·델타 그룹핑·시나리오 스크립트·시나리오 실행·계획 승인 후속 실행·인스펙터 렌더·turn.cancel/session.fork 프레임).
+- **세션 상태 (`session.status`)** — 사이드바의 모든 세션 행과 헤더가 그 세션이 **지금 무엇을 하는지** 보여준다: `busy`(턴 실행 중) / `waiting`(사용자 답을 기다림, `plan`·`permission`·`question` kind와 라벨까지). 같은 세션이 이 창에서 스트리밍 중이면 폴링을 기다리지 않고 슬롯에서 바로 읽고(`source: local`), 다른 서피스가 돌리는 턴은 데몬 원장이 알려준다. 이전 데몬이 **턴 도중 죽어 남긴 세션**은 본문 위 `RECOVERED` 배너로 알리고(세션 id·백엔드·"턴 실행 중이던 · 9분 전"), `이어받기`(`session.resume`)를 누르면 즉시 사라진다. `capabilities.sessionPhase`가 없는 구버전 데몬에는 이 호출을 아예 보내지 않고, 그래도 이 창이 돌리는 턴은 칩으로 보인다. [자세히](docs/protocol-v2-adoption.md#세션-상태-sessionstatus)
+- **프로토콜 v2 계약 채택 (전달 정직성 · 멱등 턴)**: 데몬 `hello`의 `minProtocol`·`supported[]`·`capabilities`로 **버전을 협상**하고(`-32012`면 데몬이 말하는 버전을 밝히고 연결을 거부), 연결 카드에 `protocol v2 · 7/7 capabilities`를 적는다. 턴 스트림은 이벤트 커서(`seq`)를 접어 **끊긴 번호를 직접 세고**, `session.gap`·`session.snapshot_required`를 카드 헤더 아래 경고줄로 올린다 — 저널이 잘린 턴은 끝난 뒤 `session.messages`로 다시 읽어 저장본이 더 길 때만 본문을 채운다(`resynced`/`stale`). `turn.start`/`turn.steer`에는 턴 키(`idempotencyKey`)를 붙여, 전송 실패로 끝난 재시도는 같은 키로 재생하고(`{duplicate}`), 이미 다른 연결이 시작한 턴이면 `{duplicate, inProgress}`를 받아 **새 턴을 만들지 않고 그 스트림을 계속 읽는다**. `-32001`(죽은 세션)은 `session.resume` 후 같은 키로 1회 복구한다. 자세히: [`docs/protocol-v2-adoption.md`](docs/protocol-v2-adoption.md).
+- 단위 테스트 350개(세션 위상 정규화·병합·복구 배너·구버전 데몬 하위 호환·칩 렌더·SSE 파서·OpenAI 스트림 매핑·JSON-RPC 클라이언트·버전 협상·전달 커서/갭 추적·데몬 이벤트 매핑·키드 턴 스트림·툴 정규화·계획 파싱·데모 시뮬레이터·라우팅/포맷·마크다운 렌더·툴 뷰어/계획 카드·메모리 필터/게이트 오류·세션 검색·내보내기 빌더·커맨드 카탈로그/검색/커서·정적 호스팅 판정·턴 중단·컨트롤러·와이어 탭/프레임 필터·델타 그룹핑·시나리오 스크립트·시나리오 실행·계획 승인 후속 실행·인스펙터 렌더·turn.cancel/session.fork 프레임).
 
 ![커맨드 팔레트 — ⌘K로 새 대화·세션·split·memory·내보내기·라우트를 한 번에](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/command-palette.png)
 
@@ -127,6 +128,8 @@ sequenceDiagram
 ![에이전트 제어 — 툴 결과 뷰어·턴 스티어·계획 승인 카드](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/agent-controls.png)
 
 ![메모리 CRUD · 세션 검색·보관 · 대화 내보내기](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/memory-session-export.png)
+
+![세션 상태 — 헤더·사이드바의 `waiting · plan` 칩과, 이전 데몬이 턴 도중 남긴 세션의 RECOVERED 배너](https://raw.githubusercontent.com/developjik/damon-chat-desk/main/docs/session-phase.png)
 
 ## 실행
 
@@ -263,6 +266,7 @@ python3 tools/mock-openai.py     # :1234 — /v1/models, /v1/chat/completions(SS
 | `turn.steer` / `turn.cancel` | 진행 중인 턴에 방향 수정을 주입 / 취소 |
 | `session.fork` | 세션 복사(메시지·태그·usage·resume handle) → 새 `sessionId` |
 | `plan.list` / `plan.respond` | 계획 리뷰 리비전 목록 / `expectedRevision` CAS 승인·수정요청·보류 (`-32009` 충돌) |
+| `session.status` | 라이브 세션별 `phase`·`turnId?`·`pendingAsk?` + 이전 데몬이 턴 도중 남긴 `recovered[]` — 행 칩과 복구 배너 |
 
 주의: 업스트림에서 OpenAI 호환 `/v1/chat/completions`·`/v1/models`는 **제거**되었다(에이전트가 답하는 구조로 전환).
 그래서 데스크는 `/health`의 응답 모양으로 표면을 판별하고(`backends[]` → daemon, 아니면 `/v1/models` → openai),

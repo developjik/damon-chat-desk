@@ -11,6 +11,7 @@ const CAPS: ProtocolState['capabilities'] = {
   idempotentTurns: true,
   turnLedger: true,
   versionNegotiation: true,
+  sessionPhase: true,
 };
 
 function state(protocol?: ProtocolState): DeskState {
@@ -21,7 +22,7 @@ function state(protocol?: ProtocolState): DeskState {
       baseUrl: 'http://127.0.0.1:9470',
       version: 'damond 0.9.0',
       targets: [],
-      probeNote: '1 backends · protocol v2 (negotiated) · 6/6 capabilities',
+      probeNote: '1 backends · protocol v2 (negotiated) · 7/7 capabilities',
       protocol,
     },
     conversations: [],
@@ -45,6 +46,7 @@ function state(protocol?: ProtocolState): DeskState {
     secondaryKey: null,
     sidebarOpen: false,
     inspector: { open: false, filter: 'all' },
+    sessionStatus: { supported: true, rows: [], recovered: [] },
     busy: false,
     pairing: {},
   } as DeskState;
@@ -73,7 +75,7 @@ describe('ConnectPanel — protocol card', () => {
     expect(html).toContain('min 2');
     expect(html).toContain('supported 2');
     expect(html).toContain('negotiated');
-    for (const key of ['eventSeq', 'snapshotRequired', 'connGap', 'idempotentTurns', 'turnLedger', 'versionNegotiation']) {
+    for (const key of ['eventSeq', 'snapshotRequired', 'connGap', 'idempotentTurns', 'turnLedger', 'versionNegotiation', 'sessionPhase']) {
       expect(html).toContain(key);
     }
     expect(html).toContain('유실 구간을 표시');
@@ -91,11 +93,27 @@ describe('ConnectPanel — protocol card', () => {
           idempotentTurns: false,
           turnLedger: false,
           versionNegotiation: false,
+          sessionPhase: false,
         },
       }),
     );
     expect(html).toContain('push hello');
     expect(html).toContain('프로토콜 v2 이전');
+  });
+
+  it('says where the session phases come from, and what a daemon without them means', () => {
+    const withPhases = render(state({ version: 2, negotiated: true, capabilities: CAPS }));
+    expect(withPhases).toContain('sessionPhase — session.status');
+    expect(withPhases).toContain('사이드바 칩과 복구 배너');
+
+    const without = render(
+      state({
+        version: 2,
+        negotiated: true,
+        capabilities: { ...CAPS, sessionPhase: false },
+      }),
+    );
+    expect(without).toContain('sessionPhase 없음');
   });
 
   it('shows no protocol card before a handshake', () => {

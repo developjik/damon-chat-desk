@@ -15,6 +15,7 @@ import { needsDemoFallback, pageOrigin } from './hosting';
 import { WireTap, type InspectorFilter } from './inspector';
 import { memoryErrorInfo } from './memory';
 import { listModels, streamChat } from './openai';
+import { emptySessionStatus, localSessionPhases, mergeSessionPhases, withoutRecovered } from './phases';
 import { loadState, saveState, safeStorage, type SavedState } from './persistence';
 import { planStatusFor } from './plan';
 import { RpcError } from './rpc';
@@ -34,6 +35,8 @@ import type {
   PlanDecision,
   ReplySlot,
   RouteTarget,
+  SessionStatusRow,
+  SessionStatusView,
   StreamEvent,
   TransportKind,
 } from './types';
@@ -78,6 +81,13 @@ export interface DeskState {
   primaryKey: string | null;
   secondaryKey: string | null;
   sidebarOpen: boolean;
+  /**
+   * What each live session is doing (`session.status`): phase, the ask a
+   * parked turn waits on, and the sessions a dead daemon left mid-turn.
+   * `supported: false` on a daemon that predates `capabilities.sessionPhase`
+   * — the list still draws this tab's own streaming phase from its slots.
+   */
+  sessionStatus: SessionStatusView;
   /** The JSON-RPC inspector drawer: open state and the active chip. */
   inspector: { open: boolean; filter: InspectorFilter };
   busy: boolean;
@@ -99,7 +109,16 @@ export interface DeskDeps {
   socketFactory?: import('./rpc').SocketFactory;
   /** Injectable so a test can read the frames the desk recorded. */
   wire?: WireTap;
+  /**
+   * How often to re-read `session.status` while a daemon is connected.
+   * Defaults to `STATUS_POLL_MS`; `0` turns polling off (tests drive
+   * `refreshSessionStatus()` themselves).
+   */
+  statusPollMs?: number;
 }
+
+/** A phase can change without an event on the wire, so the desk polls. */
+export const STATUS_POLL_MS = 4000;
 
 let counter = 0;
 function uid(prefix: string): string {
@@ -181,6 +200,7 @@ export class DeskController {
       secondaryKey: saved?.settings.secondaryKey ?? null,
       sidebarOpen: false,
       inspector: { open: false, filter: 'all' },
+      sessionStatus: emptySessionStatus(),
       busy: false,
       savedMasterToken: saved?.settings.masterToken,
       savedDeviceToken: saved?.settings.deviceToken,
@@ -307,6 +327,7 @@ export class DeskController {
   async enterDemo(note?: string): Promise<void> {
     this.daemon?.close();
     this.daemon = null;
+    this.stopStatusPolling();
     const targets = DEMO_ROUTES;
     this.setStateConnection({
       transport: 'demo',
@@ -316,6 +337,9 @@ export class DeskController {
       targets,
       probeNote: note ?? 'simulated daemon — no network, no keys',
     });
+    // The simulator has no ledger to read; the list draws each row's
+    // phase from this tab's own slots instead (`localSessionPhases`).
+    this.set({ sessionStatus: emptySessionStatus() });
     const savedMemory = this.loadDemoMemory();
     if (savedMemory) this.demo.hydrateMemory(savedMemory);
     this.ensureRouteSelection(targets);
@@ -391,6 +415,7 @@ export class DeskController {
     if (result.kind === 'unreachable') {
       this.daemon?.close();
       this.daemon = null;
+      this.stopStatusPolling();
       this.set({
         connection: {
           transport,
@@ -399,6 +424,7 @@ export class DeskController {
           targets: [],
           error: result.error ?? 'no daemon answered',
         },
+        sessionStatus: emptySessionStatus(),
       });
       return;
     }
@@ -431,12 +457,16 @@ export class DeskController {
           },
         });
         this.ensureRouteSelection(targets);
-        await Promise.all([this.refreshDaemonSessions(), this.refreshDaemonMemory()]);
+        await Promise.all([this.refreshDaemonSessions(), this.refreshDaemonMemory(), this.refreshSessionStatus()]);
+        // A phase changes with no event on the wire (a turn parks on an
+        // ask, another surface starts one), so the desk re-reads on a timer.
+        this.startStatusPolling();
         this.persist();
         return;
       } catch (error) {
         daemon.close();
         this.daemon = null;
+        this.stopStatusPolling();
         this.set({
           connection: {
             transport: 'daemon',
@@ -446,6 +476,7 @@ export class DeskController {
             error: (error as Error).message,
             probeNote: 'daemon answered /health but the WS handshake failed',
           },
+          sessionStatus: emptySessionStatus(),
         });
         return;
       }
@@ -458,6 +489,7 @@ export class DeskController {
         : await listModels({ baseUrl: base, apiKey: opts.masterToken, fetchImpl: this.deps.fetchImpl, tap: this.wire });
       this.daemon?.close();
       this.daemon = null;
+      this.stopStatusPolling();
       this.setStateConnection({
         transport: 'openai',
         status: 'live',
@@ -466,13 +498,24 @@ export class DeskController {
         probeNote: result.note ?? `${targets.length} models on /v1/models`,
       });
       this.ensureRouteSelection(targets);
-      this.set({ memory: { ...this.state.memory, entries: [], chars: 0, limit: 0, supported: false, view: this.emptyView('user') } });
+      this.set({
+        memory: { ...this.state.memory, entries: [], chars: 0, limit: 0, supported: false, view: this.emptyView('user') },
+        // No session ledger on this surface: only this tab's own stream
+        // could say a session is busy, and SSE has no session id.
+        sessionStatus: emptySessionStatus(),
+      });
       this.persist();
     } catch (error) {
       this.set({
         connection: { transport: 'openai', status: 'error', baseUrl: base, targets: [], error: (error as Error).message },
       });
     }
+  }
+
+  /** Re-read the session ledger after something that changes a phase. */
+  private refreshStatusSoon(): void {
+    if (this.state.connection.transport !== 'daemon' || !this.daemon) return;
+    void this.refreshSessionStatus();
   }
 
   async refreshDaemonSessions(): Promise<void> {
@@ -485,6 +528,106 @@ export class DeskController {
     } catch {
       /* listing is best-effort */
     }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* session.status — phase, pending ask, recovered                    */
+  /* ---------------------------------------------------------------- */
+
+  private statusTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Read `session.status` and fold it in: every live session's phase, the
+   * ask a parked turn waits on, and the sessions a dead daemon left
+   * mid-turn. A read that fails keeps the previous rows (they are the last
+   * thing the daemon said) and records why.
+   */
+  async refreshSessionStatus(): Promise<void> {
+    const daemon = this.daemon;
+    if (this.state.connection.transport !== 'daemon' || !daemon) {
+      if (this.state.sessionStatus.rows.length > 0 || this.state.sessionStatus.recovered.length > 0) {
+        this.set({ sessionStatus: emptySessionStatus() });
+      }
+      return;
+    }
+    try {
+      const result = await daemon.sessionStatus();
+      // The desk may have moved to another transport while this read was in
+      // flight; its answer is about a connection that is gone.
+      if (this.daemon !== daemon) return;
+      this.set({
+        sessionStatus: {
+          supported: result.supported,
+          rows: result.rows,
+          recovered: result.recovered,
+          updatedAt: Date.now(),
+        },
+      });
+    } catch (error) {
+      this.set({
+        sessionStatus: { ...this.state.sessionStatus, error: (error as Error).message, updatedAt: Date.now() },
+      });
+    }
+  }
+
+  /**
+   * Re-read on a timer while a daemon is connected. A parked ask and a turn
+   * that ends on another surface never reach this connection as events, so
+   * polling is the only honest way to keep the list from lying.
+   */
+  private startStatusPolling(): void {
+    this.stopStatusPolling();
+    const every = this.deps.statusPollMs ?? STATUS_POLL_MS;
+    if (!Number.isFinite(every) || every <= 0) return;
+    const timer = setInterval(() => {
+      void this.refreshSessionStatus();
+    }, every);
+    // Never hold a Node process (a test run) open for a poll.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.statusTimer = timer;
+  }
+
+  private stopStatusPolling(): void {
+    if (!this.statusTimer) return;
+    clearInterval(this.statusTimer);
+    this.statusTimer = null;
+  }
+
+  /** The daemon dropped the mark; drop it here so the banner goes now. */
+  private resolveRecovered(sessionId: string): void {
+    const next = withoutRecovered(this.state.sessionStatus, sessionId);
+    if (next !== this.state.sessionStatus) this.set({ sessionStatus: next });
+  }
+
+  /**
+   * Take a recovered session back (`session.resume`). The daemon prunes the
+   * mark on resume; doing the same here is what makes the banner disappear
+   * instead of waiting for the next poll (or the daemon's 24 h prune).
+   */
+  async resumeRecoveredSession(sessionId: string): Promise<boolean> {
+    const daemon = this.daemon;
+    if (!daemon) {
+      this.set({ notice: '데몬에 연결되어 있지 않습니다' });
+      return false;
+    }
+    try {
+      await daemon.resumeSession(sessionId);
+      this.resolveRecovered(sessionId);
+      this.set({ notice: '세션을 이어받았습니다 — 중단 안내가 해제됩니다' });
+      void this.refreshSessionStatus();
+      return true;
+    } catch (error) {
+      this.set({ notice: `세션을 이어받지 못했습니다 — ${(error as Error).message}` });
+      return false;
+    }
+  }
+
+  /** The live rows plus this tab's own streaming phase over them. */
+  sessionPhases(): SessionStatusRow[] {
+    return mergeSessionPhases(
+      this.state.sessionStatus.rows,
+      localSessionPhases(this.state.conversations, this.state.connection.transport),
+    );
   }
 
   /* ---------------------------------------------------------------- */
@@ -1245,6 +1388,7 @@ export class DeskController {
     );
 
     this.set({ busy: false });
+    this.refreshStatusSoon();
     this.persist();
   }
 
@@ -1328,6 +1472,7 @@ export class DeskController {
       newSession: true,
     });
     this.set({ busy: false });
+    this.refreshStatusSoon();
     this.persist();
   }
 
@@ -1619,6 +1764,14 @@ export class DeskController {
           (slot) => ({ delivery: mergeDelivery(slot.delivery, event.patch) }),
           false,
         );
+        // `resumed` means the daemon attached to a session that was not
+        // live — the exact case that leaves a `recovered` mark behind, and
+        // the point where the mark is no longer true.
+        if (event.patch.resumed) {
+          const sessionId = this.slotAt(convId, messageId, slotId)?.daemonSessionId;
+          if (sessionId) this.resolveRecovered(sessionId);
+          this.refreshStatusSoon();
+        }
         break;
       default:
         break;
@@ -1656,6 +1809,7 @@ export class DeskController {
     this.set({ busy: true });
     await this.runSlot(convId, messageId, slotId, slot.target, userMessage.text);
     this.set({ busy: false });
+    this.refreshStatusSoon();
     this.persist();
   }
 
@@ -1683,7 +1837,10 @@ export class DeskController {
       this.stoppedSlots.add(id);
       stopped += 1;
     }
-    if (stopped > 0) this.set({ notice: '턴 중단 — 부분 응답은 그대로 남습니다' });
+    if (stopped > 0) {
+      this.set({ notice: '턴 중단 — 부분 응답은 그대로 남습니다' });
+      this.refreshStatusSoon();
+    }
     return stopped;
   }
 
@@ -1700,6 +1857,8 @@ export class DeskController {
         action_id: action.id,
       });
       this.set({ notice: `${ask.name} → ${action.label}` });
+      // The parked turn resumes on the daemon; the next read says so.
+      this.refreshStatusSoon();
     } catch (error) {
       this.set({ notice: `응답 실패: ${(error as Error).message}` });
     }
@@ -1927,6 +2086,7 @@ export class DeskController {
           : {},
       );
       this.set({ notice: `계획 ${status === 'approved' ? '승인' : status === 'deferred' ? '보류' : '수정 요청'} 전달됨` });
+      this.refreshStatusSoon();
       this.persist();
       if (followUp && followUp.length > 0 && slot) {
         await this.runPlanFollowUp(ref, slot.target, followUp, plan.planId ?? plan.id);
@@ -1976,6 +2136,7 @@ export class DeskController {
     this.set({ busy: true });
     await this.runSlot(ref.convId, messageId, slotId, target, `(approved plan) ${planId}`, { followUp: beats });
     this.set({ busy: false });
+    this.refreshStatusSoon();
     this.persist();
   }
 

@@ -181,6 +181,7 @@ describe('capabilitiesOf', () => {
       idempotentTurns: false,
       turnLedger: false,
       versionNegotiation: false,
+      sessionPhase: false,
     });
   });
 
