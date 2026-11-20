@@ -1,9 +1,10 @@
-# 테스트 CI 워크플로.
+# 테스트 CI 워크플로 — 실제로 도는 파일.
 #
-# 이 파일은 `.github/workflows/ci.yml`로 옮겨야 동작한다.
-# (커밋 주체의 GitHub App 권한에 workflows 스코프가 없어 그 경로로는 푸시할 수
-#  없다 — 웹 에디터에서 복사해 넣거나, workflows 스코프가 있는 토큰으로 한 번
-#  올리면 그 뒤로는 이 파일이 원본이다. docs/ci-setup.md 참고.)
+# 이 파일이 원본이고, `docs/ci.workflow.yml`이 문서용 사본이다. 둘은 같은 내용을
+# 유지한다. `.github/workflows/` 경로는 workflows 스코프가 없는 푸시를 GitHub이
+# 거부하므로 수정은 웹 에디터로 한다. docs/ci-setup.md 참고.
+#
+# 액션은 모두 Node 24 런타임을 쓰는 메이저로 고정한다(2025-09 Node 20 deprecation).
 #
 # 무엇을 보는가:
 #   typecheck  npx tsc --noEmit          — 앱과 테스트의 타입
@@ -33,9 +34,9 @@ jobs:
     name: typecheck · test · build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
