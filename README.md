@@ -148,7 +148,9 @@ npm run dev        # http://127.0.0.1:5173/  (base 기본값 /)
 | --- | --- |
 | `npm run dev` | 개발 서버 + `/dm` 프록시(아래) |
 | `npm test` | vitest 전 시나리오 350개 |
+| `npm run test:bombadil` | Bombadil UI 불변식 — 배포된 데모를 3분간 무작위로 조작하며 명세를 검사(아래) |
 | `npm run typecheck` | `tsc` 타입 검사만 |
+| `npm run typecheck:bombadil` | `bombadil/desk.spec.ts` 명세의 타입만 |
 | `npm run build` | `dist/` (base `/`) — 자동 배포는 `VITE_BASE_PATH=/damon-chat-desk/ npm run build` |
 | `npm run preview` | 빌드 결과를 4173에서 확인 |
 
@@ -227,6 +229,53 @@ VITE_BASE_PATH=/damon-chat-desk/ npm run preview   # http://127.0.0.1:4173/damon
 `.github/workflows/` 아래이고, 고칠 때는 원본과 사본을 같이 고친다). `.github/workflows/` 경로는 푸시
 주체에 `workflows` 스코프가 없으면 거부되므로, 이 두 워크플로도 웹 에디터로 올렸고 이후 수정도 그
 권한이 있는 계정이나 웹 에디터로 한다.
+
+### UI 불변식 (Bombadil)
+
+예시를 고정해 두는 vitest와 달리, [Bombadil](https://github.com/antithesishq/bombadil)은 명세가 말한
+**성질**을 지키는지 화면을 무작위로 조작하며 본다 — 클릭·스크롤·뒤로가기, 그리고 이 데스크가 문서에
+내건 단축키(⌘K · ⌘I · Esc)와 턴 전송을 스스로 굴려 간다. 명세는
+[`bombadil/desk.spec.ts`](bombadil/desk.spec.ts) 하나다.
+
+기본 속성은 Bombadil의 기본값을 그대로 쓴다 — 콘솔 에러·미처리 예외·미처리 프로미스 거부·HTTP
+4xx/5xx가 없다. 그 위에 이 화면의 불변식을 더한다.
+
+| 속성 | 보는 것 |
+| --- | --- |
+| `singleModalAtATime` | 팔레트·연결 설정·시나리오 런처는 `aria-modal` 다이얼로그다. 동시에 둘이 열려 있으면 안 된다 |
+| `modalsAreNamed` | 보이는 모든 다이얼로그는 `aria-modal`이고 자기 이름(`aria-label`)을 갖는다 |
+| `busyMirrorsStopControl` | 스토어의 `busy`와 상단의 `■ stop` 버튼이 같이 움직인다 |
+| `inspectorMirrorsDrawer` | `inspector.open` · 실제 드로어 · 토글의 `aria-pressed`가 서로 맞는다 |
+| `transcriptMirrorsActiveConversation` | 화면의 턴 수가 활성 대화의 메시지 수와 같다 — 보낸 턴이 빠지거나 유령 턴이 남지 않는다 |
+| `transportChipMatchesStore` | 헤더의 `demo`/`daemon`/`openai` 칩이 실제 연결과 같다 |
+| `headerNamesTheConversation` | 헤더는 항상 열린 대화를 말한다(`새 대화` 포함) |
+| `singleComposer` | 컴포저는 정확히 하나만 마운트된다 |
+| `liveTurnSettles` | 살아 있는 턴은 45초 안에 끝난다 — 스트림이 멈춘 채 남으면 실패 |
+
+스토어는 `src/main.tsx`가 e2e용으로 노출하는 `window.__damonDesk`에서 읽고, 없으면 순수 DOM만으로
+검사한다. 그래서 배포된 Pages 데모에도, 로컬 빌드에도 같은 명세를 쓸 수 있다.
+
+```bash
+npm run test:bombadil                       # 배포된 Pages 데모(데모 모드)를 3분
+BOMBADIL_TIME_LIMIT=30s npm run test:bombadil
+
+# 이 작업 트리의 빌드로 돌리려면 (CI가 하는 것과 같은 경로)
+npm run build && npm run preview &          # http://127.0.0.1:4173/
+BOMBADIL_ORIGIN=http://127.0.0.1:4173/ npm run test:bombadil
+
+# 실패했을 때 그 상태를 되짚기
+npx bombadil browser inspect bombadil-output
+```
+
+CLI는 `@antithesishq/bombadil` devDependency에 들어 있고(Linux x64/arm64 · macOS arm64), Chrome은
+`CHROME` 환경변수로 지정하거나 PATH에 있으면 된다. `--no-sandbox`는 CI/컨테이너처럼 user namespace가
+막힌 곳에서 필요해서 스크립트에 넣어 두었다.
+
+[`.github/workflows/bombadil.yml`](.github/workflows/bombadil.yml)이 PR마다 같은 검사를 돌린다:
+`npx tsc -p bombadil --noEmit` → `npm run build` → `npm run preview`(백그라운드) →
+`antithesishq/bombadil-action@v3`로 5분 실행. 배포된 Pages가 아니라 **그 PR의 빌드**를 검사하고,
+위반이 있으면 `bombadil-trace` 아티팩트를 남긴다. 사본은
+[`docs/bombadil.workflow.yml`](docs/bombadil.workflow.yml)이다.
 
 ## 검증 도구
 

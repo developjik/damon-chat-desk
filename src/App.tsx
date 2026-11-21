@@ -124,6 +124,10 @@ export function App({ desk }: AppProps) {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && (event.key === 'k' || event.key === 'K')) {
         event.preventDefault();
+        // One dialog at a time: the palette is the only overlay that toggles
+        // with a key, so it must not stack on a panel that is already open
+        // (two `aria-modal` dialogs leave the scrim and the reader guessing).
+        if (connectOpen || launcherOpen) return;
         setPaletteOpen((open) => !open);
         return;
       }
@@ -146,7 +150,7 @@ export function App({ desk }: AppProps) {
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [desk, overlayOpen, launcherOpen]);
+  }, [desk, overlayOpen, launcherOpen, connectOpen]);
 
   const connect = (transport: TransportKind, baseUrl: string, opts: { masterToken?: string; deviceToken?: string }) => {
     void desk.connect(transport, baseUrl, opts).then(() => setConnectOpen(false));

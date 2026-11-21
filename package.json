@@ -10,13 +10,16 @@
     "preview": "vite preview --port 4173 --strictPort",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:bombadil": "bombadil browser test --headless --no-sandbox --exit-on-violation --time-limit ${BOMBADIL_TIME_LIMIT:-3m} ${BOMBADIL_ORIGIN:-https://developjik.github.io/damon-chat-desk/} bombadil/desk.spec.ts",
+    "typecheck:bombadil": "tsc -p bombadil --noEmit"
   },
   "dependencies": {
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
+    "@antithesishq/bombadil": "0.8.0",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "4.7.0",
