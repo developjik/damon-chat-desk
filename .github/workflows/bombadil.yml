@@ -1,0 +1,91 @@
+# UI 불변식 워크플로 (Bombadil) — 실제로 도는 파일.
+#
+# 이 파일이 원본이고, `docs/bombadil.workflow.yml`이 문서용 사본이다. 둘은 같은
+# 내용을 유지한다. `.github/workflows/` 경로는 workflows 스코프가 없는 푸시를
+# GitHub이 거부하므로 수정은 웹 에디터로 한다. docs/ci-setup.md 참고.
+#
+# 무엇을 보는가:
+#   typecheck  npx tsc -p bombadil --noEmit — 명세(spec)의 타입
+#   build      npm run build                — 이 PR의 코드로 만든 데스크
+#   serve      npm run preview              — 127.0.0.1:4173에 그 빌드를 띄운다
+#   invariants bombadil browser test        — 그 화면을 무작위로 조작하며 명세의
+#                                            속성을 검사 (console error, 미처리
+#                                            예외, HTTP 4xx/5xx, 모달 중첩,
+#                                            스토어↔렌더 불일치, 턴 정지 여부)
+#
+# 배포된 Pages가 아니라 **이 실행에서 빌드한 번들**을 테스트한다. 그래야 PR이
+# 자기 코드로 검사받는다. 데모 모드는 localStorage가 비어 있으면 스스로 뜨므로
+# 데몬도 키도 필요 없다.
+#
+# 실패하면 `bombadil-trace` 아티팩트를 내려받아
+#   npx bombadil browser inspect bombadil-trace
+# 로 위반 상태를 되짚어 볼 수 있다. 아티팩트는 실행이 성공해도 남긴다.
+name: bombadil
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bombadil-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-invariants:
+    name: ui invariants (bombadil)
+    runs-on: ubuntu-latest
+    # time-limit(5m) + 설치·빌드가 끝나고도 Chrome이 trace를 쓸 시간을 남긴다.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck specification
+        run: npx tsc -p bombadil --noEmit
+
+      - name: Build
+        run: npm run build
+
+      # 뒤 단계에서 같은 job의 백그라운드 프로세스로 계속 돈다.
+      - name: Serve the built desk
+        run: |
+          npm run preview &
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4173/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "preview did not answer on 127.0.0.1:4173" >&2
+          exit 1
+
+      - name: UI invariants
+        uses: antithesishq/bombadil-action@v3
+        with:
+          origin: http://127.0.0.1:4173/
+          specification: ./bombadil/desk.spec.ts
+          # package.json의 devDependency와 같은 버전을 쓴다.
+          version: 0.8.0
+          time-limit: 5m
+          exit-on-violation: true
+          output-path: bombadil-output
+
+      - name: Keep the trace
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bombadil-trace
+          path: bombadil-output
+          if-no-files-found: ignore
