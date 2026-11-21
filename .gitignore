@@ -9,6 +9,10 @@ node_modules/
 # build
 dist/
 dist-ssr/
+*.tsbuildinfo
+
+# bombadil trace output (`npm run test:bombadil`는 시스템 temp에 쓴다)
+bombadil-output/
 
 # editor / os
 .DS_Store
