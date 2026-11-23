@@ -518,7 +518,9 @@ export class DeskController {
    */
   async retryConnection(): Promise<void> {
     const { transport, baseUrl, status } = this.state.connection;
-    if (transport === 'demo' || status === 'probing' || status === 'live') return;
+    // A network drop closes the daemon socket but leaves the handshake's `live`.
+    const dropped = transport === 'daemon' && status === 'live' && !this.daemon?.connected;
+    if (transport === 'demo' || status === 'probing' || (status === 'live' && !dropped)) return;
     await this.connect(transport, baseUrl, {
       masterToken: this.state.savedMasterToken,
       deviceToken: this.state.savedDeviceToken,
