@@ -382,6 +382,7 @@ export function App({ desk, shell }: AppProps) {
           onCompare={(compare: boolean) => desk.setCompare(compare)}
           onMemory={(enabled: boolean) => desk.setMemoryEnabled(enabled)}
           placeholder={reach && reach.kind !== 'demo-offline' ? `${reach.title} — 다시 시도하거나 데모로 전환하세요` : undefined}
+          draftKey={state.activeId ?? ''}
         />
       </main>
 

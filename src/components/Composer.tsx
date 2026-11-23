@@ -5,17 +5,19 @@ import { RoutePicker } from './RoutePicker';
 /** The unsent draft survives a reload (e.g. accepting a shell update). */
 const DRAFT_KEY = 'damon-desk.draft';
 
-function readDraft(): string {
+/** Restored only into the chat it was typed for. */
+function readDraft(chat: string): string {
   try {
-    return globalThis.sessionStorage?.getItem(DRAFT_KEY) ?? '';
+    const saved = JSON.parse(globalThis.sessionStorage?.getItem(DRAFT_KEY) ?? 'null') as { chat?: string; text?: string } | null;
+    return saved?.chat === chat && typeof saved.text === 'string' ? saved.text : '';
   } catch {
     return '';
   }
 }
 
-function writeDraft(value: string): void {
+function writeDraft(chat: string, text: string): void {
   try {
-    if (value) globalThis.sessionStorage?.setItem(DRAFT_KEY, value);
+    if (text) globalThis.sessionStorage?.setItem(DRAFT_KEY, JSON.stringify({ chat, text }));
     else globalThis.sessionStorage?.removeItem(DRAFT_KEY);
   } catch {
     /* storage blocked: the draft just stays in memory */
@@ -38,6 +40,8 @@ interface ComposerProps {
   onCompare: (compare: boolean) => void;
   onMemory: (enabled: boolean) => void;
   placeholder?: string;
+  /** The chat the draft belongs to (`activeId`, or '' for a new chat). */
+  draftKey?: string;
 }
 
 export function Composer({
@@ -55,11 +59,12 @@ export function Composer({
   onCompare,
   onMemory,
   placeholder,
+  draftKey = '',
 }: ComposerProps) {
-  const [value, setValue] = useState(readDraft);
+  const [value, setValue] = useState(() => readDraft(draftKey));
   const area = useRef<HTMLTextAreaElement | null>(null);
 
-  useEffect(() => writeDraft(value), [value]);
+  useEffect(() => writeDraft(draftKey, value), [draftKey, value]);
 
   useEffect(() => {
     const node = area.current;
