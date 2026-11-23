@@ -1149,6 +1149,7 @@ export class DeskController {
       const status = await transport.pairStatus(token.deviceId, token.token);
       this.set({ pairing: { ...this.state.pairing, status } });
       if (status === 'approved') {
+        this.attemptTokens = { ...this.attemptTokens, deviceToken: token.token };
         this.set({ savedDeviceToken: token.token, notice: '기기가 승인되었습니다 — 데몬에 다시 연결하세요.' });
       }
     } catch (error) {
