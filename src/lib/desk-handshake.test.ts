@@ -160,6 +160,22 @@ describe('DeskController — protocol v2 handshake', () => {
     expect(connection.probeNote).toContain('7/7 capabilities');
   });
 
+  it('stops claiming live when the daemon socket drops', async () => {
+    const deps = env({ hello: MODERN_HELLO });
+    const desk = new DeskController({
+      storage: new MemoryStorage(),
+      demo: new DemoTransport({ sleep: async () => undefined }),
+      fetchImpl: deps.fetchImpl,
+      socketFactory: deps.socketFactory,
+    });
+    await desk.connect('daemon', 'http://127.0.0.1:9470');
+    expect(desk.getSnapshot().connection.status).toBe('live');
+    deps.sockets.at(-1)!.onclose?.();
+    expect(desk.getSnapshot().connection).toMatchObject({ transport: 'daemon', status: 'offline' });
+    await desk.retryConnection();
+    expect(desk.getSnapshot().connection.status).toBe('live');
+  });
+
   it('says plainly what an older daemon cannot do', async () => {
     // A 0.7-era daemon: no version range, no capabilities, no negotiation.
     const deps = env({ hello: { protocol: 2, daemon: 'damond', version: '0.7.2', backends: ['claude'] } });

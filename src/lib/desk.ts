@@ -442,6 +442,7 @@ export class DeskController {
         const targets = await daemon.routes(result.health?.backends ?? hello.backends ?? []);
         this.daemon?.close();
         this.daemon = daemon;
+        daemon.onClosed(() => this.daemonDropped(daemon));
         const protocol = daemon.protocol;
         const offered = PROTOCOL_CAPABILITIES.filter((key) => protocol.capabilities[key]);
         this.set({
@@ -528,6 +529,18 @@ export class DeskController {
       masterToken: this.attemptTokens.masterToken ?? this.state.savedMasterToken,
       deviceToken: this.attemptTokens.deviceToken ?? this.state.savedDeviceToken,
       silent: true,
+    });
+  }
+
+  /** The live socket closed: show it as unreachable instead of a stale `live`. */
+  private daemonDropped(daemon: DaemonTransport): void {
+    if (this.daemon !== daemon) return;
+    this.daemon = null;
+    this.stopStatusPolling();
+    const { baseUrl } = this.state.connection;
+    this.set({
+      connection: { transport: 'daemon', status: 'offline', baseUrl, targets: [], error: 'daemon connection closed' },
+      sessionStatus: emptySessionStatus(),
     });
   }
 

@@ -439,6 +439,11 @@ export class DaemonTransport {
     return this.rpc?.connected ?? false;
   }
 
+  /** The daemon went away under a live connection. */
+  onClosed(handler: () => void): () => void {
+    return this.rpc?.onClosed(handler) ?? (() => undefined);
+  }
+
   get client(): RpcClient {
     if (!this.rpc) throw new Error('daemon transport is not connected');
     return this.rpc;
