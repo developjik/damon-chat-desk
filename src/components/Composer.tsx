@@ -2,6 +2,26 @@ import { useEffect, useRef, useState } from 'react';
 import type { RouteTarget } from '../lib/types';
 import { RoutePicker } from './RoutePicker';
 
+/** The unsent draft survives a reload (e.g. accepting a shell update). */
+const DRAFT_KEY = 'damon-desk.draft';
+
+function readDraft(): string {
+  try {
+    return globalThis.sessionStorage?.getItem(DRAFT_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function writeDraft(value: string): void {
+  try {
+    if (value) globalThis.sessionStorage?.setItem(DRAFT_KEY, value);
+    else globalThis.sessionStorage?.removeItem(DRAFT_KEY);
+  } catch {
+    /* storage blocked: the draft just stays in memory */
+  }
+}
+
 interface ComposerProps {
   targets: RouteTarget[];
   primaryKey: string | null;
@@ -36,8 +56,10 @@ export function Composer({
   onMemory,
   placeholder,
 }: ComposerProps) {
-  const [value, setValue] = useState('');
+  const [value, setValue] = useState(readDraft);
   const area = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => writeDraft(value), [value]);
 
   useEffect(() => {
     const node = area.current;
