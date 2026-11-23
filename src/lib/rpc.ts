@@ -137,6 +137,7 @@ export class RpcClient {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private handlers = new Set<EventHandler>();
+  private closeHandlers = new Set<() => void>();
   hello: HelloPayload | null = null;
   /** True when the handshake was confirmed with a versioned `hello`. */
   negotiated = false;
@@ -229,9 +230,11 @@ export class RpcClient {
         fail(new Error('socket error — check the daemon URL'));
       };
       socket.onclose = () => {
+        const wasOpen = this.hello !== null;
         this.socket = null;
         this.failAll(new Error('socket closed'));
         fail(new Error('socket closed before hello'));
+        if (wasOpen) for (const handler of this.closeHandlers) handler();
       };
       socket.onmessage = (message) => {
         const frame = parseFrame(message.data);
@@ -346,6 +349,12 @@ export class RpcClient {
       this.pending.delete(id);
       pending.reject(error);
     }
+  }
+
+  /** The socket dropped after the handshake (not on `close()`). */
+  onClosed(handler: () => void): () => void {
+    this.closeHandlers.add(handler);
+    return () => this.closeHandlers.delete(handler);
   }
 
   close(): void {

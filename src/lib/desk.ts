@@ -22,6 +22,7 @@ import { RpcError } from './rpc';
 import { scenarioById, type ScenarioBeat, type ScenarioId } from './scenarios';
 import { makeTarget } from './targets';
 import { mergeToolCall } from './tools';
+import { DAEMON_CLOSED } from './reachability';
 import { PROTOCOL_CAPABILITIES } from './types';
 import type {
   ChatMessage,
@@ -144,6 +145,8 @@ export class DeskController {
   private state: DeskState;
   private demo: DemoTransport;
   private daemon: DaemonTransport | null = null;
+  /** Tokens of the last attempt — saved ones are only written on success. */
+  private attemptTokens: { masterToken?: string; deviceToken?: string } = {};
   private storage: Storage | undefined;
   private deps: DeskDeps;
   private aborters = new Map<string, AbortController>();
@@ -407,6 +410,7 @@ export class DeskController {
   ): Promise<void> {
     if (transport === 'demo') return this.enterDemo();
     const base = normalizeBaseUrl(baseUrl);
+    this.attemptTokens = { masterToken: opts.masterToken, deviceToken: opts.deviceToken };
     this.set({
       connection: { transport, status: 'probing', baseUrl: base, targets: this.state.connection.targets, probeNote: 'probing /health and /v1/models…' },
     });
@@ -439,6 +443,7 @@ export class DeskController {
         const targets = await daemon.routes(result.health?.backends ?? hello.backends ?? []);
         this.daemon?.close();
         this.daemon = daemon;
+        daemon.onClosed(() => this.daemonDropped(daemon));
         const protocol = daemon.protocol;
         const offered = PROTOCOL_CAPABILITIES.filter((key) => protocol.capabilities[key]);
         this.set({
@@ -457,6 +462,8 @@ export class DeskController {
           },
         });
         this.ensureRouteSelection(targets);
+        // Closed during route discovery, before onClosed was listening.
+        if (!daemon.connected) return this.daemonDropped(daemon);
         await Promise.all([this.refreshDaemonSessions(), this.refreshDaemonMemory(), this.refreshSessionStatus()]);
         // A phase changes with no event on the wire (a turn parks on an
         // ask, another surface starts one), so the desk re-reads on a timer.
@@ -510,6 +517,34 @@ export class DeskController {
         connection: { transport: 'openai', status: 'error', baseUrl: base, targets: [], error: (error as Error).message },
       });
     }
+  }
+
+  /**
+   * Probe the current URL again with the saved tokens — the banner's
+   * "다시 시도", and what the page does when the network comes back.
+   */
+  async retryConnection(): Promise<void> {
+    const { transport, baseUrl, status } = this.state.connection;
+    // A network drop closes the daemon socket but leaves the handshake's `live`.
+    const dropped = transport === 'daemon' && status === 'live' && !this.daemon?.connected;
+    if (transport === 'demo' || status === 'probing' || (status === 'live' && !dropped)) return;
+    await this.connect(transport, baseUrl, {
+      masterToken: this.attemptTokens.masterToken ?? this.state.savedMasterToken,
+      deviceToken: this.attemptTokens.deviceToken ?? this.state.savedDeviceToken,
+      silent: true,
+    });
+  }
+
+  /** The live socket closed: show it as unreachable instead of a stale `live`. */
+  private daemonDropped(daemon: DaemonTransport): void {
+    if (this.daemon !== daemon) return;
+    this.daemon = null;
+    this.stopStatusPolling();
+    const { baseUrl } = this.state.connection;
+    this.set({
+      connection: { transport: 'daemon', status: 'offline', baseUrl, targets: [], error: DAEMON_CLOSED },
+      sessionStatus: emptySessionStatus(),
+    });
   }
 
   /** Re-read the session ledger after something that changes a phase. */
@@ -1130,6 +1165,7 @@ export class DeskController {
       const status = await transport.pairStatus(token.deviceId, token.token);
       this.set({ pairing: { ...this.state.pairing, status } });
       if (status === 'approved') {
+        this.attemptTokens = { ...this.attemptTokens, deviceToken: token.token };
         this.set({ savedDeviceToken: token.token, notice: '기기가 승인되었습니다 — 데몬에 다시 연결하세요.' });
       }
     } catch (error) {

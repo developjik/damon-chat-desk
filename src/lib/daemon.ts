@@ -434,6 +434,16 @@ export class DaemonTransport {
     return hello;
   }
 
+  /** False once the socket has closed, even if the handshake succeeded. */
+  get connected(): boolean {
+    return this.rpc?.connected ?? false;
+  }
+
+  /** The daemon went away under a live connection. */
+  onClosed(handler: () => void): () => void {
+    return this.rpc?.onClosed(handler) ?? (() => undefined);
+  }
+
   get client(): RpcClient {
     if (!this.rpc) throw new Error('daemon transport is not connected');
     return this.rpc;

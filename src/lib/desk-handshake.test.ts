@@ -29,6 +29,8 @@ interface WireOptions {
   hello: Record<string, unknown>;
   /** Answer the versioned `hello` request, or refuse it like an old daemon. */
   helloAnswer?: 'result' | 'unsupported' | 'unknown-method';
+  /** Drop the socket instead of answering route discovery. */
+  closeOnModels?: boolean;
 }
 
 /**
@@ -67,6 +69,10 @@ class DaemonSocket implements SocketLike {
         this.deliver({ id, result: { ...this.options.hello, methods: [{ name: 'hello' }] } });
         return;
       case 'catalog.models':
+        if (this.options.closeOnModels) {
+          this.close();
+          return;
+        }
         this.deliver({ id, result: { models: [] } });
         return;
       case 'session.list':
@@ -158,6 +164,34 @@ describe('DeskController — protocol v2 handshake', () => {
     expect(connection.probeNote).toContain('protocol v2');
     expect(connection.probeNote).toContain('(negotiated)');
     expect(connection.probeNote).toContain('7/7 capabilities');
+  });
+
+  it('stops claiming live when the daemon socket drops', async () => {
+    const deps = env({ hello: MODERN_HELLO });
+    const desk = new DeskController({
+      storage: new MemoryStorage(),
+      demo: new DemoTransport({ sleep: async () => undefined }),
+      fetchImpl: deps.fetchImpl,
+      socketFactory: deps.socketFactory,
+    });
+    await desk.connect('daemon', 'http://127.0.0.1:9470');
+    expect(desk.getSnapshot().connection.status).toBe('live');
+    deps.sockets.at(-1)!.onclose?.();
+    expect(desk.getSnapshot().connection).toMatchObject({ transport: 'daemon', status: 'offline' });
+    await desk.retryConnection();
+    expect(desk.getSnapshot().connection.status).toBe('live');
+  });
+
+  it('does not publish live when the socket drops during route discovery', async () => {
+    const deps = env({ hello: MODERN_HELLO, closeOnModels: true });
+    const desk = new DeskController({
+      storage: new MemoryStorage(),
+      demo: new DemoTransport({ sleep: async () => undefined }),
+      fetchImpl: deps.fetchImpl,
+      socketFactory: deps.socketFactory,
+    });
+    await desk.connect('daemon', 'http://127.0.0.1:9470');
+    expect(desk.getSnapshot().connection).toMatchObject({ transport: 'daemon', status: 'offline' });
   });
 
   it('says plainly what an older daemon cannot do', async () => {
