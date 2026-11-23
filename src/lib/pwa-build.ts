@@ -46,31 +46,50 @@ export function hashContent(parts: Array<string | Uint8Array>): string {
   return hash.toString(16).padStart(8, '0');
 }
 
-/** What gets precached: every built file except the worker and source maps. */
-export function shellManifest(built: BuiltFile[], publicFiles: string[] = PUBLIC_SHELL_FILES): ShellManifest {
+/**
+ * What gets precached: every built file except the worker and source maps.
+ * `publicBytes` are the `public/` files' contents, so a deploy that only
+ * changes an icon or the web manifest still ships a new worker.
+ */
+export function shellManifest(
+  built: BuiltFile[],
+  publicFiles: string[] = PUBLIC_SHELL_FILES,
+  publicBytes: BuiltFile[] = [],
+): ShellManifest {
   const shell = built
     .filter((file) => file.fileName !== SW_FILE && !file.fileName.endsWith('.map'))
     .sort((a, b) => a.fileName.localeCompare(b.fileName));
   const files = [...new Set([...shell.map((file) => file.fileName), ...publicFiles])].sort();
-  const version = hashContent([...files, ...shell.flatMap((file) => [file.fileName, file.content])]);
+  const hashed = [...shell, ...publicBytes].sort((a, b) => a.fileName.localeCompare(b.fileName));
+  const version = hashContent([...files, ...hashed.flatMap((file) => [file.fileName, file.content])]);
   return { version, files };
+}
+
+/** Node's fs, typed locally: this project carries no @types/node. */
+type ReadFile = (path: string) => Promise<Uint8Array>;
+
+async function readPublic(publicDir: string, files: string[]): Promise<BuiltFile[]> {
+  const fs = (await import('node:fs/promises' as string)) as { readFile: ReadFile };
+  return Promise.all(files.map(async (fileName) => ({ fileName, content: await fs.readFile(`${publicDir}/${fileName}`) })));
 }
 
 export function shellPlugin(): Plugin {
   let root = '';
+  let publicDir = '';
   return {
     name: 'damon-desk-shell',
     apply: 'build',
     enforce: 'post',
     configResolved(config) {
       root = config.root;
+      publicDir = config.publicDir;
     },
     buildStart() {
       this.emitFile({ type: 'chunk', id: `${root}/src/sw.ts`, fileName: SW_FILE });
     },
     generateBundle: {
       order: 'post',
-      handler(_options, bundle) {
+      async handler(_options, bundle) {
         const worker = bundle[SW_FILE];
         if (!worker || worker.type !== 'chunk') return this.error(`${SW_FILE} was not emitted`);
         // Registered as a classic script: it must not import anything.
@@ -81,7 +100,7 @@ export function shellPlugin(): Plugin {
           fileName: file.fileName,
           content: file.type === 'chunk' ? file.code : file.source,
         }));
-        const manifest = shellManifest(built);
+        const manifest = shellManifest(built, PUBLIC_SHELL_FILES, await readPublic(publicDir, PUBLIC_SHELL_FILES));
         if (!worker.code.includes(SW_PLACEHOLDER)) return this.error(`${SW_FILE} lost its ${SW_PLACEHOLDER} placeholder`);
         worker.code = worker.code.split(SW_PLACEHOLDER).join(JSON.stringify(manifest));
       },

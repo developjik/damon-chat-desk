@@ -21,6 +21,9 @@ describe('shellManifest', () => {
     expect(shellManifest(built).version).toBe(base);
     expect(shellManifest(built.map((f) => (f.fileName === 'index.html' ? { ...f, content: '<html lang=ko>' } : f))).version).not.toBe(base);
     expect(shellManifest(built.map((f) => (f.fileName === SW_FILE ? { ...f, content: 'other' } : f))).version).toBe(base);
+    const icon = (byte: number) => [{ fileName: 'icons/icon-192.png', content: new Uint8Array([byte]) }];
+    expect(shellManifest(built, undefined, icon(1)).version).toBe(shellManifest(built, undefined, icon(1)).version);
+    expect(shellManifest(built, undefined, icon(1)).version).not.toBe(shellManifest(built, undefined, icon(2)).version);
   });
 
   it('hashes bytes and strings alike', () => {
