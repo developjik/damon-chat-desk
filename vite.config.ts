@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import { resolveBasePath } from './src/lib/hosting';
+import { shellPlugin } from './src/lib/pwa-build';
 
 /**
  * The config runs in Node before Vite loads. This project has no
@@ -31,7 +32,8 @@ export default defineConfig({
     host: '127.0.0.1',
     proxy: { '/dm': { target: 'http://127.0.0.1:9470', changeOrigin: true, rewrite: stripDm, ws: true } },
   },
-  plugins: [react()],
+  // shellPlugin emits sw.js (offline app shell) — build only.
+  plugins: [react(), shellPlugin()],
   build: {
     target: 'es2020',
     outDir: 'dist',

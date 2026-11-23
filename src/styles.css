@@ -94,7 +94,9 @@ a {
 .app {
   display: grid;
   grid-template-columns: 268px minmax(0, 1fr);
-  height: 100dvh;
+  /* --vv-height: the visible box (src/lib/viewport.ts) — keeps the
+     composer above the iOS keyboard, which does not shrink 100dvh. */
+  height: var(--vv-height, 100dvh);
   overflow: hidden;
 }
 
@@ -121,6 +123,9 @@ a {
   background: var(--surface);
   border-right: 1px solid var(--line);
   padding: 12px 12px 8px;
+  padding-top: max(12px, env(safe-area-inset-top));
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+  padding-left: max(12px, env(safe-area-inset-left));
   overflow-y: auto;
   scrollbar-width: thin;
 }
@@ -597,9 +602,10 @@ a {
   display: flex;
   align-items: center;
   gap: 12px;
-  height: 56px;
+  /* Standalone iOS draws the status bar over the page (black-translucent). */
+  height: calc(56px + env(safe-area-inset-top, 0px));
   flex: none;
-  padding: 0 18px;
+  padding: env(safe-area-inset-top, 0px) max(18px, env(safe-area-inset-right)) 0 max(18px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--line);
   background: var(--bg);
 }
@@ -1248,6 +1254,7 @@ a {
 .composer {
   flex: none;
   padding: 10px 20px 12px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   background: var(--bg);
 }
@@ -2487,7 +2494,7 @@ a {
 
 .overlay.palette-overlay {
   align-items: flex-start;
-  padding-top: min(14vh, 124px);
+  padding-top: calc(min(14vh, 124px) + env(safe-area-inset-top, 0px));
 }
 
 .palette {
@@ -2629,7 +2636,7 @@ a {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 22px;
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   z-index: 80;
   max-width: min(90vw, 520px);
@@ -2719,7 +2726,21 @@ a {
   }
 
   .composer {
-    padding: 8px 12px 10px;
+    padding: 8px max(12px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  }
+
+  /* The keyboard covers the home indicator; no inset under the input. */
+  .keyboard-open .composer {
+    padding-bottom: 8px;
+  }
+
+  /* iOS pans the layout viewport under an open keyboard; pin the desk to
+     the visible box so the composer rides on top of the keyboard. */
+  .app {
+    position: fixed;
+    top: var(--vv-top, 0px);
+    left: 0;
+    right: 0;
   }
 
   .composer-foot {
@@ -2795,7 +2816,7 @@ a {
      the keyboard hint chips are desktop-only. */
   .palette-overlay {
     padding: 12px;
-    padding-top: 10vh;
+    padding-top: calc(10vh + env(safe-area-inset-top, 0px));
   }
 
   .palette {
@@ -4106,7 +4127,7 @@ a {
 
   .scenario-overlay {
     padding: 12px;
-    padding-top: 6vh;
+    padding-top: calc(6vh + env(safe-area-inset-top, 0px));
   }
 
   .scenario-sheet {
@@ -4324,4 +4345,85 @@ a {
   .topbar-sub .phase-chip .phase-label {
     display: none;
   }
+}
+
+/* --------------------------------------------------- reach banner */
+
+/* No network vs. nothing answering at the URL (src/lib/reachability.ts).
+   Red when the backend is gone; amber when demo carries on offline. */
+.reach-banner {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px max(18px, env(safe-area-inset-right)) 11px max(18px, env(safe-area-inset-left));
+  border-bottom: 1px solid rgba(239, 107, 107, 0.3);
+  background: rgba(239, 107, 107, 0.07);
+}
+
+.reach-banner.demo-offline {
+  border-bottom-color: rgba(216, 165, 66, 0.28);
+  background: rgba(216, 165, 66, 0.06);
+}
+
+.reach-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reach-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #f4a3a3;
+}
+
+.reach-banner.demo-offline .reach-title {
+  color: #e3c07a;
+}
+
+.reach-detail {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.reach-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+/* --------------------------------------------------- update prompt */
+
+.update-prompt {
+  position: fixed;
+  left: 50%;
+  bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 85;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 24px);
+  padding: 7px 8px 7px 12px;
+  border: 1px solid rgba(124, 140, 248, 0.4);
+  border-radius: 8px;
+  background: var(--surface-2);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.update-copy {
+  white-space: nowrap;
+}
+
+.primary-btn.tiny-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+  align-self: center;
 }

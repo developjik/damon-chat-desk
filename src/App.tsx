@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import type { DeskController, DeskState } from './lib/desk';
+import type { ShellStatus } from './lib/pwa';
+import { reachNotice } from './lib/reachability';
 import type { PaletteHandlers } from './lib/commands';
 import { copyText, downloadPayload } from './lib/download';
 import type { ExportFormat } from './lib/export';
@@ -13,11 +15,14 @@ import { ExportMenu } from './components/ExportMenu';
 import { Inspector, InspectorToggle } from './components/Inspector';
 import { ScenarioLauncher, ScenarioStrip } from './components/ScenarioLauncher';
 import { PhaseChip, RecoveredBanner } from './components/SessionPhase';
+import { ReachBanner } from './components/ReachBanner';
 import { Sidebar } from './components/Sidebar';
 import { Transcript } from './components/Transcript';
+import { UpdatePrompt } from './components/UpdatePrompt';
 
 interface AppProps {
   desk: DeskController;
+  shell: ShellStatus;
 }
 
 const SUGGESTIONS: Array<{ label: string; prompt: string }> = [
@@ -82,8 +87,11 @@ function EmptyState({
   );
 }
 
-export function App({ desk }: AppProps) {
+export function App({ desk, shell }: AppProps) {
   const state = useSyncExternalStore(desk.subscribe, desk.getSnapshot);
+  const network = useSyncExternalStore(shell.subscribe, shell.getSnapshot);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const reach = reachNotice(state.connection, network.online);
   const [connectOpen, setConnectOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [launcherOpen, setLauncherOpen] = useState(false);
@@ -326,6 +334,14 @@ export function App({ desk }: AppProps) {
           </div>
         </header>
 
+        <ReachBanner
+          notice={reach}
+          busy={state.connection.status === 'probing'}
+          onRetry={() => void desk.retryConnection()}
+          onDemo={() => void desk.enterDemo()}
+          onSettings={() => setConnectOpen(true)}
+        />
+
         <RecoveredBanner
           rows={state.sessionStatus.recovered}
           onResume={(sessionId) => void desk.resumeRecoveredSession(sessionId)}
@@ -365,6 +381,7 @@ export function App({ desk }: AppProps) {
           onSecondary={(key: string) => desk.setSecondary(key)}
           onCompare={(compare: boolean) => desk.setCompare(compare)}
           onMemory={(enabled: boolean) => desk.setMemoryEnabled(enabled)}
+          placeholder={reach && reach.kind !== 'demo-offline' ? `${reach.title} — 다시 시도하거나 데모로 전환하세요` : undefined}
         />
       </main>
 
@@ -392,6 +409,12 @@ export function App({ desk }: AppProps) {
       <CommandPalette open={paletteOpen} state={state} handlers={paletteHandlers} onClose={closePalette} />
 
       <ScenarioLauncher open={launcherOpen} busy={state.busy} onClose={() => setLauncherOpen(false)} onRun={runScenario} />
+
+      <UpdatePrompt
+        open={network.updateReady && !updateDismissed}
+        onUpdate={() => shell.applyUpdate()}
+        onDismiss={() => setUpdateDismissed(true)}
+      />
 
       {toast ? <div className="toast mono">{toast}</div> : null}
     </div>

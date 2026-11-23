@@ -512,6 +512,20 @@ export class DeskController {
     }
   }
 
+  /**
+   * Probe the current URL again with the saved tokens — the banner's
+   * "다시 시도", and what the page does when the network comes back.
+   */
+  async retryConnection(): Promise<void> {
+    const { transport, baseUrl, status } = this.state.connection;
+    if (transport === 'demo' || status === 'probing' || status === 'live') return;
+    await this.connect(transport, baseUrl, {
+      masterToken: this.state.savedMasterToken,
+      deviceToken: this.state.savedDeviceToken,
+      silent: true,
+    });
+  }
+
   /** Re-read the session ledger after something that changes a phase. */
   private refreshStatusSoon(): void {
     if (this.state.connection.transport !== 'daemon' || !this.daemon) return;
