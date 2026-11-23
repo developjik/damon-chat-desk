@@ -461,6 +461,8 @@ export class DeskController {
           },
         });
         this.ensureRouteSelection(targets);
+        // Closed during route discovery, before onClosed was listening.
+        if (!daemon.connected) return this.daemonDropped(daemon);
         await Promise.all([this.refreshDaemonSessions(), this.refreshDaemonMemory(), this.refreshSessionStatus()]);
         // A phase changes with no event on the wire (a turn parks on an
         // ask, another surface starts one), so the desk re-reads on a timer.
