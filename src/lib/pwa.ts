@@ -58,6 +58,7 @@ export class ShellStatus {
 
   setWaiting(worker: WaitingWorker | null): void {
     this.waiting = worker;
+    this.takenOver = false;
     this.set({ updateReady: !!worker });
   }
 
@@ -80,7 +81,8 @@ export class ShellStatus {
       this.reload();
       return;
     }
-    this.takenOver = true;
+    // Without a waiting shell this is the first install claiming the page.
+    if (this.waiting) this.takenOver = true;
   }
 }
 

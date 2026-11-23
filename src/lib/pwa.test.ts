@@ -99,6 +99,17 @@ describe('ShellStatus', () => {
     expect(waiting.posted).toEqual([]);
   });
 
+  it('does not treat the first install claiming the page as a takeover', () => {
+    let reloads = 0;
+    const shell = new ShellStatus(true, () => (reloads += 1));
+    shell.controllerChanged();
+    const waiting = worker('installed');
+    shell.setWaiting(waiting);
+    expect(shell.applyUpdate()).toBe(true);
+    expect(waiting.posted).toEqual([{ type: SKIP_WAITING }]);
+    expect(reloads).toBe(0);
+  });
+
   it('notifies only on real changes', () => {
     const shell = new ShellStatus(true);
     let calls = 0;
