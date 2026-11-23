@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { reachNotice } from './reachability';
+import { DAEMON_CLOSED, reachNotice } from './reachability';
 import type { ConnectionState } from './types';
 
 const conn = (patch: Partial<ConnectionState>): ConnectionState => ({
@@ -28,6 +28,13 @@ describe('reachNotice', () => {
     expect(unreachable?.title).toBe('데몬에 닿지 않음');
     expect(unreachable?.detail).toContain('http://127.0.0.1:9470');
     expect(unreachable).toMatchObject({ retry: true, demo: true });
+  });
+
+  it('says a live daemon went away instead of blaming /health', () => {
+    const notice = reachNotice(conn({ status: 'offline', error: DAEMON_CLOSED }), true);
+    expect(notice).toMatchObject({ kind: 'unreachable', retry: true });
+    expect(notice?.detail).toContain('연결이 끊겼습니다');
+    expect(notice?.detail).not.toContain('/health');
   });
 
   it('reports a failed handshake with its error', () => {

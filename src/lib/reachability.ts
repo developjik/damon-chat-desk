@@ -7,6 +7,9 @@
 
 import type { ConnectionState } from './types';
 
+/** `connection.error` when a live daemon socket closed (not a failed probe). */
+export const DAEMON_CLOSED = 'daemon connection closed';
+
 export type ReachKind = 'offline' | 'unreachable' | 'failed' | 'demo-offline';
 
 export interface ReachNotice {
@@ -45,7 +48,9 @@ export function reachNotice(connection: ConnectionState, online: boolean): Reach
       kind: 'unreachable',
       title: `${surface}에 닿지 않음`,
       detail:
-        connection.transport === 'daemon'
+        connection.error === DAEMON_CLOSED
+          ? `${connection.baseUrl}의 데몬과 연결이 끊겼습니다 — 데몬이 다시 실행되면 다시 시도하세요.`
+          : connection.transport === 'daemon'
           ? `${connection.baseUrl}의 /health가 응답하지 않습니다 — 데몬이 실행 중인지, 주소와 /dm 프록시가 맞는지 확인하세요.`
           : `${connection.baseUrl}의 /v1/models가 응답하지 않습니다 — 서버가 실행 중인지, 주소가 맞는지 확인하세요.`,
       retry: true,

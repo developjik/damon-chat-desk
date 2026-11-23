@@ -22,6 +22,7 @@ import { RpcError } from './rpc';
 import { scenarioById, type ScenarioBeat, type ScenarioId } from './scenarios';
 import { makeTarget } from './targets';
 import { mergeToolCall } from './tools';
+import { DAEMON_CLOSED } from './reachability';
 import { PROTOCOL_CAPABILITIES } from './types';
 import type {
   ChatMessage,
@@ -541,7 +542,7 @@ export class DeskController {
     this.stopStatusPolling();
     const { baseUrl } = this.state.connection;
     this.set({
-      connection: { transport: 'daemon', status: 'offline', baseUrl, targets: [], error: 'daemon connection closed' },
+      connection: { transport: 'daemon', status: 'offline', baseUrl, targets: [], error: DAEMON_CLOSED },
       sessionStatus: emptySessionStatus(),
     });
   }
