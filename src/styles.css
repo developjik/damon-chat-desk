@@ -4416,6 +4416,7 @@ a {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: max-content;
   max-width: calc(100vw - 24px);
   padding: 7px 8px 7px 12px;
   border: 1px solid rgba(124, 140, 248, 0.4);
@@ -4427,6 +4428,11 @@ a {
 }
 
 .update-copy {
+  min-width: 0;
+}
+
+.update-prompt button {
+  flex-shrink: 0;
   white-space: nowrap;
 }
 
