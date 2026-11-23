@@ -144,6 +144,8 @@ export class DeskController {
   private state: DeskState;
   private demo: DemoTransport;
   private daemon: DaemonTransport | null = null;
+  /** Tokens of the last attempt — saved ones are only written on success. */
+  private attemptTokens: { masterToken?: string; deviceToken?: string } = {};
   private storage: Storage | undefined;
   private deps: DeskDeps;
   private aborters = new Map<string, AbortController>();
@@ -407,6 +409,7 @@ export class DeskController {
   ): Promise<void> {
     if (transport === 'demo') return this.enterDemo();
     const base = normalizeBaseUrl(baseUrl);
+    this.attemptTokens = { masterToken: opts.masterToken, deviceToken: opts.deviceToken };
     this.set({
       connection: { transport, status: 'probing', baseUrl: base, targets: this.state.connection.targets, probeNote: 'probing /health and /v1/models…' },
     });
@@ -522,8 +525,8 @@ export class DeskController {
     const dropped = transport === 'daemon' && status === 'live' && !this.daemon?.connected;
     if (transport === 'demo' || status === 'probing' || (status === 'live' && !dropped)) return;
     await this.connect(transport, baseUrl, {
-      masterToken: this.state.savedMasterToken,
-      deviceToken: this.state.savedDeviceToken,
+      masterToken: this.attemptTokens.masterToken ?? this.state.savedMasterToken,
+      deviceToken: this.attemptTokens.deviceToken ?? this.state.savedDeviceToken,
       silent: true,
     });
   }
