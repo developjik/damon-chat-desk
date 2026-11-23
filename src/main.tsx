@@ -9,7 +9,7 @@ import './styles.css';
 const desk = new DeskController();
 void desk.init();
 
-const shell = new ShellStatus(navigator.onLine);
+const shell = new ShellStatus(navigator.onLine, () => location.reload());
 watchNetwork(window, shell, () => void desk.retryConnection());
 trackViewport(window, document.documentElement);
 // Dev serves modules from Vite; only a build has a shell to cache.

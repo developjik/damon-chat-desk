@@ -29,9 +29,13 @@ export class ShellStatus {
   private waiting: WaitingWorker | null = null;
   /** Set once the user accepted; the next controller change reloads. */
   updating = false;
+  /** Another tab already activated the new shell; Update just reloads. */
+  private takenOver = false;
+  private readonly reload: () => void;
 
-  constructor(online = true) {
+  constructor(online = true, reload: () => void = () => undefined) {
     this.state = { online, updateReady: false };
+    this.reload = reload;
   }
 
   subscribe = (listener: () => void): (() => void) => {
@@ -60,9 +64,23 @@ export class ShellStatus {
   /** Tell the waiting worker to take over; the page reloads on `controllerchange`. */
   applyUpdate(): boolean {
     if (!this.waiting) return false;
+    if (this.takenOver) {
+      this.reload();
+      return true;
+    }
     this.updating = true;
     this.waiting.postMessage({ type: SKIP_WAITING_MESSAGE });
     return true;
+  }
+
+  /** `controllerchange`: reload if this tab asked for it, else remember. */
+  controllerChanged(): void {
+    if (this.updating) {
+      this.updating = false;
+      this.reload();
+      return;
+    }
+    this.takenOver = true;
   }
 }
 
@@ -103,11 +121,7 @@ const UPDATE_CHECK_MS = 30 * 60 * 1000;
 export function registerShell(shell: ShellStatus, base: string): void {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   const container = navigator.serviceWorker;
-  container.addEventListener('controllerchange', () => {
-    if (!shell.updating) return;
-    shell.updating = false;
-    location.reload();
-  });
+  container.addEventListener('controllerchange', () => shell.controllerChanged());
   container
     .register(`${base}sw.js`, { scope: base })
     .then((registration) => {

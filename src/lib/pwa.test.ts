@@ -76,6 +76,29 @@ describe('ShellStatus', () => {
     expect(shell.updating).toBe(true);
   });
 
+  it('reloads on controllerchange only when this tab asked', () => {
+    let reloads = 0;
+    const shell = new ShellStatus(true, () => (reloads += 1));
+    const waiting = worker('installed');
+    shell.setWaiting(waiting);
+    shell.applyUpdate();
+    shell.controllerChanged();
+    expect(reloads).toBe(1);
+    expect(shell.updating).toBe(false);
+  });
+
+  it('turns Update into a plain reload after another tab took over', () => {
+    let reloads = 0;
+    const shell = new ShellStatus(true, () => (reloads += 1));
+    const waiting = worker('installed');
+    shell.setWaiting(waiting);
+    shell.controllerChanged();
+    expect(reloads).toBe(0);
+    expect(shell.applyUpdate()).toBe(true);
+    expect(reloads).toBe(1);
+    expect(waiting.posted).toEqual([]);
+  });
+
   it('notifies only on real changes', () => {
     const shell = new ShellStatus(true);
     let calls = 0;
