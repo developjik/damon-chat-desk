@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, stat } from 'node:fs/promises';
 const root = resolve(process.env.DOGFOOD_ROOT ?? '.');
 const tools = resolve(process.env.DOGFOOD_TOOLS ?? '.dogfood-tools');
 const out = resolve(process.env.DOGFOOD_OUT ?? `.dogfood-output/run-${new Date().toISOString().replace(/[:.]/g,'-')}`);
@@ -81,11 +81,18 @@ try {
       await page.evaluate(() => { for(let i=0;i<2;i++) { const el=document.createElement('div'); el.setAttribute('aria-modal','true'); el.textContent='Synthetic fault oracle'; document.body.append(el); } });
     }}], plan:[{action:'inject-two-modals'}],invariants:builtinInvariants(),
     outputDir:resolve(out,'guard-fault-oracle'),shrink:false});
-  const oracleDetected = !fault.ok && fault.violation?.invariant === 'singleModalAtATime';
+  // The pinned guard can swallow screenshot write errors. Require actual nonempty evidence.
+  const oracleArtifacts = {};
+  for (const key of ['trace','report','repro','dom','screenshot']) {
+    const path = fault.artifacts?.[key];
+    oracleArtifacts[key] = typeof path === 'string' && await stat(path).then(s => s.isFile() && s.size > 0, () => false);
+  }
+  const oracleDetected = !fault.ok && fault.violation?.invariant === 'singleModalAtATime'
+    && Object.values(oracleArtifacts).every(Boolean);
   const summary={scene:'synthetic-stream-complete',scenario:'built-in pr-review (synthetic fixture)',transport:'demo',paidCalls:0,blockedRequests,
     comparison:{exitCode:comparison.exitCode,stats:comparison.stats,report:comparison.reportPath},
     guard:{ok:result.ok,observed,violation:result.violation,seed:result.seed,artifacts:result.artifacts},
-    faultOracle:{detected:oracleDetected,violation:fault.violation,artifacts:fault.artifacts},
+    faultOracle:{detected:oracleDetected,verifiedArtifacts:oracleArtifacts,violation:fault.violation,artifacts:fault.artifacts},
     limitations:['same-build captures, not a visual regression baseline','one deterministic turn, not broad randomized coverage','no live daemon or provider validation','DOM contract uses existing CSS classes and guard auto-generated IDs','streamEventOrder omitted: demo is in-process, not a captured wire transport','visual changes are reported, not used as a gate; only capture errors fail proofshot']};
   await writeFile(resolve(out,'summary.json'),JSON.stringify(summary,null,2)+'\n');
   console.log(JSON.stringify(summary,null,2));
