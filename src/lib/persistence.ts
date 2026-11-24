@@ -39,8 +39,10 @@ export function loadState(storage: Storage | undefined = safeStorage()): SavedSt
   }
 }
 
-export function saveState(state: SavedState, storage: Storage | undefined = safeStorage()): void {
-  if (!storage) return;
+export type SaveResult = { status: 'saved' } | { status: 'unavailable' } | { status: 'failed' };
+
+export function saveState(state: SavedState, storage: Storage | undefined = safeStorage()): SaveResult {
+  if (!storage) return { status: 'unavailable' };
   try {
     // Live slots are transient; keep finished text only.
     const conversations = state.conversations.map((conversation) => ({
@@ -51,17 +53,15 @@ export function saveState(state: SavedState, storage: Storage | undefined = safe
       })),
     }));
     storage.setItem(KEY, JSON.stringify({ ...state, conversations }));
+    return { status: 'saved' };
   } catch {
-    /* quota or privacy mode — the desk still works in memory */
+    return { status: 'failed' };
   }
 }
 
 export function safeStorage(): Storage | undefined {
   try {
     if (typeof localStorage === 'undefined') return undefined;
-    const probe = '__damon_probe__';
-    localStorage.setItem(probe, '1');
-    localStorage.removeItem(probe);
     return localStorage;
   } catch {
     return undefined;
