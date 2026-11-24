@@ -8,6 +8,9 @@ checkout() {
   local repo="$1" rev="$2" dir="$tools/$1"
   if [ ! -d "$dir" ]; then git clone "https://github.com/developjik/$repo.git" "$dir"; fi
   if [ -n "$(git -C "$dir" status --porcelain)" ]; then echo "Refusing dirty tool checkout: $dir" >&2; exit 1; fi
+  if ! git -C "$dir" cat-file -e "$rev^{commit}" 2>/dev/null; then
+    git -C "$dir" fetch origin "$rev"
+  fi
   git -C "$dir" checkout --detach "$rev"
   test "$(git -C "$dir" rev-parse HEAD)" = "$rev"
   (cd "$dir" && npm ci && npm run build)
