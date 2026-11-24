@@ -24,3 +24,7 @@ bombadil-output/
 # python test double
 __pycache__/
 *.pyc
+
+# Optional local DEV-72 verification
+.dogfood-tools/
+.dogfood-output/
